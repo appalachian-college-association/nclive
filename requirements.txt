@@ -1,0 +1,21 @@
+# requirements.txt
+structlog
+urllib3
+pathlib
+
+# Updated requirements including MARC processing and OCLC KB API capabilities
+
+# Existing dependencies for OCLC API
+requests>=2.32.4
+python-dotenv>=1.0.0
+
+# Data processing
+pandas>=2.3.1
+numpy>=2.3.0
+
+# MARC record processing
+pymarc>=5.3.1
+
+# Development tools (optional)
+pytest>=8.4.1
+black>=23.0.0
