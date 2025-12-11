@@ -582,10 +582,12 @@ class InfobaseMARCProcessor:
         all_records = []
         
         # Find FOD and Just for Kids files (only in main directory, not archived)
-        fod_files = [f for f in self.marc_dir.glob("FOD*.mrc") if f.parent == self.marc_dir]
-        just_files = [f for f in self.marc_dir.glob("[Jj]ust*.mrc") if f.parent == self.marc_dir]
+        fod_files = list(self.marc_dir.glob("FOD*.mrc")) + list(self.marc_dir.glob("[Ff]ilm*.mrc"))
+        fod_files = [f for f in fod_files if f.parent == self.marc_dir]
+        jfk_files = list(self.marc_dir.glob("JFK*.mrc")) + list(self.marc_dir.glob("[Jj]ust*.mrc"))
+        jfk_files = [f for f in jfk_files if f.parent == self.marc_dir]
         
-        marc_files = fod_files + just_files
+        marc_files = fod_files + jfk_files
         
         if not marc_files:
             logger.warning(f"No MARC files found in {self.marc_dir}")
@@ -607,36 +609,59 @@ class InfobaseMARCProcessor:
         """
         Generate search_terms.tsv file for main.py OCLC API searches.
         Only includes records that need OCLC number lookup after hierarchical matching.
+        
+        IMPORTANT: Only searches on xtid values, NOT customid values.
+        customid values don't correspond to MARC 028 fields and cause bad matches.
         """
         logger.info("Generating search terms using hierarchical lookup...")
         
         search_terms = []
+        customid_manual_review = []  # Track customid records that need manual review
         
         for record in self.current_records:
             lookup_id_collection = record['lookup_id_collection']
+            lookup_id = record['lookup_id']
             
             # Use hierarchical lookup to determine best OCLC number
             oclc_number, source = self._determine_best_oclc_number(record)
             
             # Only add to search terms if no reliable OCLC number was found
             if source == "NEEDS_SEARCH":
-                # Extract numeric title ID for search
-                id_match = re.search(r'(?:xtid|customid)=(.+)\$', record['lookup_id'])
-                if id_match:
-                    search_id = id_match.group(1)
+                # Check if this is an xtid or customid
+                # ONLY search on xtid values - these correspond to MARC 028 fields
+                xtid_match = re.search(r'xtid=(.+)\$', lookup_id)
+                
+                if xtid_match:
+                    # This is an xtid - safe to search in API
+                    search_id = xtid_match.group(1)
                     search_term = f"sn:{search_id}"  # Serial number search
                     search_terms.append((lookup_id_collection, search_term))
+                    logger.debug(f"Added xtid for API search: {lookup_id_collection}")
+                else:
+                    # Check if this is a customid - these should NOT be searched
+                    customid_match = re.search(r'customid=(.+)\$', lookup_id)
+                    if customid_match:
+                        # This is a customid - mark for manual review instead
+                        customid_manual_review.append(lookup_id_collection)
+                        logger.warning(f"Skipping API search for customid (will need manual review): {lookup_id_collection}")
+                    else:
+                        # Unknown format - log a warning
+                        logger.error(f"Unknown lookup_id format (neither xtid nor customid): {lookup_id}")
         
-        # Write search terms file
+        # Write search terms file (only xtid records)
         output_path = Path(output_file)
         with open(output_path, 'w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file, delimiter='\t')
             writer.writerow(['lookupIDcollection', 'discovery-api-search'])
             writer.writerows(search_terms)
         
-        logger.info(f"Generated {len(search_terms)} search terms in {output_file}")
-        return str(output_path)
-    
+        logger.info(f"Generated {len(search_terms)} search terms (xtid only) in {output_file}")
+        
+        if customid_manual_review:
+            logger.warning(f"Found {len(customid_manual_review)} customid records that will need manual review")
+            logger.warning(f"These records will not be searched via API (customid doesn't match MARC 028)")
+        
+        return str(output_path)    
     def analyze_kbart_changes(self) -> Dict[str, List]:
         """
         Analyze what records need to be added/removed from KBART.

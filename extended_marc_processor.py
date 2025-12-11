@@ -365,6 +365,9 @@ class ExtendedMARCProcessor:
         """
         Search OCLC Discovery API using the main.py query format without kw:Infobase.
         This mimics the main.py search but removes the Infobase keyword constraint.
+        
+        IMPORTANT: Only searches on xtid values, NOT customid values.
+        customid values don't correspond to MARC 028 fields and cause bad matches.
 
         Args:
             lookup_id: The lookup ID (e.g., "xtid=296504$")
@@ -380,13 +383,24 @@ class ExtendedMARCProcessor:
         try:
             token = self.get_token_cached()
 
-            # Extract numeric ID from lookup_id format (e.g., "xtid=296504$" -> "296504")
-            id_match = re.search(r'(?:xtid|customid)=(.+)\$', lookup_id)
-            if not id_match:
-                logger.warning(f"Could not extract numeric ID from lookup_id: {lookup_id}")
-                return []
+            # Extract numeric ID from lookup_id format
+            # ONLY search on xtid values - these correspond to MARC 028 fields
+            xtid_match = re.search(r'xtid=(.+)\$', lookup_id)
+							
+																						   
+						 
             
-            numeric_id = id_match.group(1)
+            if not xtid_match:
+                # Check if this is a customid - these should NOT be searched via sn:
+                customid_match = re.search(r'customid=(.+)\$', lookup_id)
+                if customid_match:
+                    logger.warning(f"Skipping infobase ID search for customid (doesn't match MARC 028): {lookup_id}")
+                    return []  # Return empty - customid can't be searched this way
+                else:
+                    logger.warning(f"Could not extract xtid from lookup_id: {lookup_id}")
+                    return []
+            
+            numeric_id = xtid_match.group(1)
 
             # Build query similar to main.py but without kw:Infobase
             # Original main.py query: "x4:digital AND kw:Infobase AND (sn:296504)"
