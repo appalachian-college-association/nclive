@@ -37,7 +37,6 @@ duplicate_lookup_ids.csv
 setup_environment.py
 archive_run.py
 onehub_downloader.py
-kbart_downloader_with_comparison.py
 kbart_classification_diagnostic.py
 collection_diagnostic.py
 *checker.py
