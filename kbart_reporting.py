@@ -8,6 +8,7 @@ and provides detailed statistics on additions, removals, and retained records.
 
 import pandas as pd
 import csv
+import re
 from pathlib import Path
 import logging
 from datetime import datetime
@@ -224,6 +225,19 @@ class KBARTChangeReporter:
                             old_file = potential_file
                             break
             
+            if not old_file.exists():
+                # Strip NC Live datestamp prefix: fod_reload_YYMMDD_ or jfk_reload_YYMMDD_
+                stripped_name = re.sub(r'^(?:fod|jfk)_reload_\d{6}_', '', new_file.name)
+                if stripped_name != new_file.name:
+                    potential_old_files = [
+                        self.old_kbart_dir / stripped_name,
+                        self.old_kbart_dir / stripped_name.replace('_kbart.txt', '.txt'),
+                    ]
+                    for potential_file in potential_old_files:
+                        if potential_file.exists():
+                            old_file = potential_file
+                            break
+
             if old_file.exists():
                 file_pairs.append((old_file, new_file))
                 logger.info(f"Found file pair: {old_file.name} -> {new_file.name}")
