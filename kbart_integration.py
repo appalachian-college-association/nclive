@@ -70,6 +70,16 @@ class KBARTFinalIntegrator:
         # Remove hashmarks that cause loading issues
         cleaned_text = str(text).replace('#', '')
         return cleaned_text
+    
+    def fix_customid_case(self, title_id_encoded):
+        """Transform customid= to customID= for Infobase's case-sensitive platform."""
+        if not title_id_encoded:
+            return title_id_encoded
+        
+        if title_id_encoded.lower().startswith('customid'):
+            return 'customID' + title_id_encoded[8:]
+        
+        return title_id_encoded  # Leave xtid unchanged
             
     
     def load_existing_kbart_entries(self, kbart_dir="kbart_files"):
@@ -101,7 +111,7 @@ class KBARTFinalIntegrator:
                         
                         if title_id_encoded and entry_id:
                             # Decode title_id for conversion to lookupIDcollection format
-                            decoded_title_id = title_id_encoded.replace('%3D', '=').replace('%2D', '-')
+                            decoded_title_id = title_id_encoded.replace('%3D', '=').replace('%2D', '-').lower()
                             
                             # Convert to lookupIDcollection format
                             # From "xtid=123456" -> "xtid=123456$fod" or "xtid=123456$jfk"
@@ -213,6 +223,7 @@ class KBARTFinalIntegrator:
         
         prefix = title_match.group(1)
         numeric_id = title_match.group(2)
+        url_prefix = "customID" if prefix.lower() == "customid" else prefix
         
         # Create encoded title_id for KBART
         title_id_encoded = f"{prefix}%3D{numeric_id}"
@@ -220,9 +231,9 @@ class KBARTFinalIntegrator:
         # Create title_url
         collection_type = collection_info['type']
         if collection_type == 'fod':
-            title_url = f"https://fod.infobase.com/portalplaylists.aspx?{prefix}={numeric_id}"
+            title_url = f"https://fod.infobase.com/portalplaylists.aspx?{url_prefix}={numeric_id}"
         else:  # jfk
-            title_url = f"https://jfk.infobase.com/portalplaylists.aspx?{prefix}={numeric_id}"
+            title_url = f"https://jfk.infobase.com/portalplaylists.aspx?{url_prefix}={numeric_id}"
         
         # Get OCLC number
         oclc_number = row.get('verifiedOCN', '')
@@ -231,6 +242,7 @@ class KBARTFinalIntegrator:
         if lookup_id_collection in self.existing_entry_ids:
             # Use existing entry_id
             entry_id = self.existing_entry_ids[lookup_id_collection]['entry_id']
+            existing_ids_in_file.add(entry_id)  # Register so new entries don't duplicate it
             self.stats['preserved_entry_ids'] += 1
             logger.debug(f"Preserved entry_id {entry_id} for {lookup_id_collection}")
         else:
@@ -288,6 +300,8 @@ class KBARTFinalIntegrator:
         
         logger.info(f"Creating KBART for {collection_id} with {len(collection_df)} entries")
         
+        date_string = datetime.now().strftime('%y%m%d')
+
         # Update collection statistics
         if collection_type == 'fod':
             self.stats['fod_records'] = len(collection_df)
@@ -299,7 +313,7 @@ class KBARTFinalIntegrator:
         
         # Create KBART records
         kbart_records = []
-        
+
         for _, row in collection_df.iterrows():
             kbart_record = self.create_kbart_record(row, collection_id, collection_info, existing_ids_in_file)
             if kbart_record:
@@ -310,6 +324,9 @@ class KBARTFinalIntegrator:
         if not kbart_records:
             logger.warning(f"No valid KBART records created for {collection_id}")
             return None
+        
+        for record in kbart_records:
+            record['title_id'] = self.fix_customid_case(record['title_id'])
         
         # Create output filename
         output_filename = f"{collection_id}_kbart.txt"
@@ -325,7 +342,7 @@ class KBARTFinalIntegrator:
         
         # Also create NC Live equivalent
         nc_live_id = collection_info['nc_live_equivalent']
-        nc_live_filename = f"{nc_live_id}_kbart.txt"
+        nc_live_filename = f"{collection_type}_reload_{date_string}_{nc_live_id}_kbart.txt"
         nc_live_path = self.output_dir / nc_live_filename
         
         # Modify records for NC Live (only collection name and ID differ)
