@@ -26,6 +26,7 @@ final_kbart/
 *.tsv
 *results
 duplicate_lookup_ids.csv
+onehub_uploader.py
 
 # Reports
 *_report.txt
@@ -34,6 +35,7 @@ duplicate_lookup_ids.csv
 # Config / scripts
 *.bat
 *.yaml
+.pylintrc
 setup_environment.py
 archive_run.py
 onehub_downloader.py
