@@ -45,7 +45,7 @@ class InfobaseMARCProcessor:
     2. KBART files (current collection data) - SECONDARY
     3. MARC 035 field validation (filtered for title ID contamination) - TERTIARY
     """
-    
+
     def __init__(self, 
                  marc_files_dir: str = "nclivemrc",
                  kbart_dir: str = "kbart_files",
@@ -83,15 +83,15 @@ class InfobaseMARCProcessor:
                 }
             else:
                 raise  # Re-raise if it's a different error
-        
+
         # Create directories if they don't exist
         self.kbart_dir.mkdir(exist_ok=True)
-        
+
         # Storage for processed data
         self.current_records = []  # Records from current MARC files
         self.infobase_lookup = {}  # PRIMARY: Manually verified OCLC numbers from InfobaseLookup.csv
         self.kbart_lookup = {}     # SECONDARY: Current KBART entries
-        
+
         # Statistics tracking
         self.stats = {
             'total_processed': 0,
@@ -112,14 +112,14 @@ class InfobaseMARCProcessor:
         Converts %3D to = and %2D to - for matching.
         """
         return text.replace('%3D', '=').replace('%2D', '-')
-        
+
     def _encode_url_encoding(self, text: str) -> str:
         """
         Encode to URL percent-encoding for KBART output.
         Converts = to %3D and - to %2D for KBART compatibility.
         """
         return text.replace('=', '%3D').replace('-', '%2D')
-    
+
     def load_existing_data(self):
         """
         Load existing lookup data with hierarchical priority:
@@ -127,17 +127,17 @@ class InfobaseMARCProcessor:
         2. KBART files (SECONDARY)
         """
         logger.info("Loading existing lookup data with hierarchical priority...")
-        
+
         # PRIMARY: Load InfobaseLookup.csv (manually verified matches)
         if self.lookup_file.exists():
             try:
                 df = pd.read_csv(self.lookup_file, dtype=self.oclc_dtypes, keep_default_na=False)
                 logger.info(f"InfobaseLookup columns found: {list(df.columns)}")
-                
+
                 # Based on your sample structure, use 'verifiedOCN' column
                 verified_ocn_col = 'verifiedOCN'
                 lookup_id_col = 'lookupID'
-                
+
                 if verified_ocn_col not in df.columns:
                     logger.warning("Could not find 'verifiedOCN' column in InfobaseLookup.csv")
                     logger.info("Available columns: " + ", ".join(df.columns))
@@ -153,13 +153,13 @@ class InfobaseMARCProcessor:
                     logger.warning(f"Using fallback column: {verified_ocn_col}")
                 else:
                     logger.info(f"Using expected column: {verified_ocn_col}")
-                
+
                 if verified_ocn_col in df.columns and lookup_id_col in df.columns:
                     # Create lookup dictionary: lookupID -> verified OCLC number
                     for _, row in df.iterrows():
                         lookup_id = str(row.get(lookup_id_col, '')).strip()
                         verified_ocn = str(row.get(verified_ocn_col, '')).strip()
-                        
+
                         # Also capture original NC Live OCN if available for comparison
                         original_nclive_ocn = ""
                         if 'originalNCLiveOCN' in df.columns:
@@ -169,7 +169,7 @@ class InfobaseMARCProcessor:
                             mrc_key = str(row.get('InfobaseMRCkey_original', '')).strip()
                             if '|' in mrc_key:
                                 original_nclive_ocn = mrc_key.split('|')[0].strip()
-                        
+
                         # Only store valid, verified OCLC numbers (not empty or NaN)
                         # Your data uses integers, so handle both int and string formats
                         if (lookup_id and verified_ocn and 
@@ -180,42 +180,42 @@ class InfobaseMARCProcessor:
                                 'verified_ocn': verified_ocn,
                                 'original_nclive_ocn': original_nclive_ocn
                             }
-                    
+
                     logger.info(f"PRIMARY: Loaded {len(self.infobase_lookup)} manually verified entries from InfobaseLookup.csv")
-                    
+
             except Exception as e:
                 logger.warning(f"Could not load InfobaseLookup file: {e}")
         else:
             logger.warning(f"InfobaseLookup file not found: {self.lookup_file}")
-        
+
         # SECONDARY: Load current KBART files
         kbart_records_loaded = 0
         for kbart_file in self.kbart_dir.glob("*.txt"):
             try:
                 df = pd.read_csv(kbart_file, sep='\t', low_memory=False)
-                
+
                 # Handle different possible column names in KBART files
                 title_id_col = None
                 oclc_col = None
-                
+
                 for col in df.columns:
                     col_lower = col.lower()
                     if 'title_id' in col_lower or 'titleid' in col_lower:
                         title_id_col = col
                     elif 'oclc' in col_lower and ('number' in col_lower or 'num' in col_lower):
                         oclc_col = col
-                
+
                 if title_id_col and oclc_col:
                     for _, row in df.iterrows():
                         title_id_encoded = str(row.get(title_id_col, '')).strip()
                         oclc_num = str(row.get(oclc_col, '')).strip()
-                        
+
                         if (title_id_encoded and oclc_num and 
                             oclc_num.lower() not in ['', 'nan', 'null']):
-                            
+
                             # DECODE the percent-encoded title_id for matching
                             title_id_decoded = self._decode_url_encoding(title_id_encoded)
-                            
+
                             # Create lookup ID format to match your InfobaseLookup format
                             # Convert from xtid%3D184316 to xtid=184316$
                             if title_id_decoded.startswith(('xtid=', 'customid=')):
@@ -226,7 +226,7 @@ class InfobaseMARCProcessor:
                                 # Handle cases where it might be just the numeric ID
                                 lookup_id_format = f"customid={title_id_decoded}$"
                                 numeric_id = title_id_decoded
-                            
+
                             # Only store if not already in primary lookup
                             if lookup_id_format not in self.infobase_lookup:
                                 self.kbart_lookup[numeric_id] = {
@@ -235,15 +235,15 @@ class InfobaseMARCProcessor:
                                     'decoded_title_id': title_id_decoded   # Decoded for matching
                                 }
                                 kbart_records_loaded += 1
-                                
+
                 logger.info(f"SECONDARY: Loaded {len(df)} entries from {kbart_file.name}")
-        
+
             except Exception as e:
                 logger.warning(f"Could not load KBART file {kbart_file}: {e}")
-				
+
         logger.info(f"SECONDARY: Total unique KBART records loaded: {kbart_records_loaded}")
         logger.info(f"TOTAL AUTHORITY RECORDS: {len(self.infobase_lookup)} (primary) + {len(self.kbart_lookup)} (secondary)")
-    
+
     def extract_marc_fields(self, marc_file: Path) -> List[Dict]:
         """
         Extract relevant fields from MARC file.
@@ -251,20 +251,20 @@ class InfobaseMARCProcessor:
         Returns list of dictionaries with extracted field data.
         """
         records = []
-        
+
         try:
             with open(marc_file, 'rb') as file:
                 reader = MARCReader(file)
-                
+
                 for record in reader:
                     if record is None:
                         continue
-                    
+
                     self.stats['total_processed'] += 1
-                    
+
                     # Extract fields following your OpenRefine logic
                     record_data = self._extract_record_fields(record)
-                    
+
                     if record_data:
                         records.append(record_data)
                     else:
@@ -274,7 +274,7 @@ class InfobaseMARCProcessor:
                         title = field_245_a[0] if field_245_a else "No title found"
                         field_028_a = self._get_subfield_values(record, '028', 'a')
                         field_856_u = self._get_subfield_values(record, '856', 'u')
-                        
+
                         # Extract numeric title ID for tracking
                         title_id_numeric = "Unknown"
                         if field_028_a:
@@ -285,7 +285,7 @@ class InfobaseMARCProcessor:
                                 numeric_match = re.search(r'\d+', first_title_id)
                                 if numeric_match:
                                     title_id_numeric = numeric_match.group()
-                        
+
                         rejection_info = {
                             'nc_live_title_id': title_id_numeric,
                             'control_001': control_001,
@@ -294,15 +294,15 @@ class InfobaseMARCProcessor:
                             'raw_title_ids': field_028_a,
                             'url': field_856_u[0] if field_856_u else "No URL"
                         }
-                        
+
                         self.stats['rejected_records'].append(rejection_info)
-                        
+
         except Exception as e:
             logger.error(f"Error reading MARC file {marc_file}: {e}")
-        
+
         logger.info(f"Extracted {len(records)} valid records from {marc_file.name}")
         return records
-    
+
     def _extract_record_fields(self, record: Record) -> Optional[Dict]:
         """Extract and process fields from a single MARC record."""
         try:
@@ -314,7 +314,7 @@ class InfobaseMARCProcessor:
             field_245_a = self._get_subfield_values(record, '245', 'a')  # Title
             field_856_u = self._get_subfield_values(record, '856', 'u')  # URLs
             field_856_z = self._get_subfield_values(record, '856', 'z')  # URL descriptions
-            
+
             # Process 028$a field (title IDs) - can contain multiple IDs separated by semicolons
             title_ids = []
             for value in field_028_a:
@@ -322,20 +322,29 @@ class InfobaseMARCProcessor:
                     title_ids.extend([id.strip() for id in value.split(';')])
                 else:
                     title_ids.append(value.strip())
-            
+
             # Find the correct title ID by matching with 856$u URL
             lookup_id = self._validate_title_id_with_url(title_ids, field_856_u, field_856_z)
-            
+
             if not lookup_id:
                 return None
-            
+
             # Extract and clean OCLC number from 035$a (TERTIARY source)
             marc_035_ocn = self._extract_oclc_number(field_035_a, title_ids)
-            
+
             # Determine collection type
-            collection_type = 'fod' if any('Films on Demand' in z for z in field_856_z) else 'jfk'
+            collection_type = 'fod' if any(
+                'Films on Demand' in z
+                or 'FOD Collection' in z
+                or 'AVOD Collection' in z
+                for z in field_856_z
+            ) else 'jfk'
             lookup_id_collection = f"{lookup_id}{collection_type}"
-            
+
+            # Extract avod_title_id for new Access Video on Demand FOD records
+            # Returns format/path_id (e.g., 'video/7384'); empty string for JFK and old-format FOD
+            avod_title_id = self._extract_avod_title_id(field_856_u[0]) if field_856_u else ""
+
             record_data = {
                 'control_001': control_001,
                 'lookup_id': lookup_id,
@@ -345,15 +354,16 @@ class InfobaseMARCProcessor:
                 'url': field_856_u[0] if field_856_u else "",
                 'collection_type': collection_type,
                 'title_ids_raw': field_028_a,
-                'url_description': field_856_z[0] if field_856_z else ""
+                'url_description': field_856_z[0] if field_856_z else "",
+                'avod_title_id': avod_title_id
             }
-            
+
             return record_data
-            
+
         except Exception as e:
             logger.warning(f"Error processing record: {e}")
             return None
-    
+
     def _get_subfield_values(self, record: Record, field_tag: str, subfield_code: str) -> List[str]:
         """Extract all values for a specific subfield."""
         values = []
@@ -362,28 +372,51 @@ class InfobaseMARCProcessor:
             subfields = field.get_subfields(subfield_code)
             values.extend(subfields)
         return values
-    
+
     def _validate_title_id_with_url(self, title_ids: List[str], urls: List[str], url_descriptions: List[str]) -> Optional[str]:
         """
         Validate title ID by checking if it appears in the 856$u URL.
         Only accepts title IDs that come from xtid= or customid= URL parameters.
         
+        For new Access Video on Demand FOD URLs (access.infobase.com), the 028$a
+        still contains the old xtid value but no longer appears in the URL.
+        These records skip cross-validation and use the 028$a value directly.
+        
         Fallback: If no title IDs found in MARC 028$a, extract from URL.
         """
         if not urls:
             return None
-        
+
         url = urls[0].lower()  # Convert to lowercase for matching
-        
+
+        # NEW: Access Video on Demand platform detection (new FOD URLs)
+        # The 028$a value is still the old xtid but does not appear in the new URL,
+        # so URL cross-validation is skipped for these records.
+        # If 028$a is absent entirely, fall back to the path_id from the URL itself.
+        if 'access.infobase.com' in url:
+            if title_ids:
+                for title_id in title_ids:
+                    title_id_clean = title_id.strip()
+                    if title_id_clean.isdigit():
+                        return f"xtid={title_id_clean}$"
+            # No 028$a available: extract path_id from the URL as the identifier
+            path_match = re.search(r'access\.infobase\.com/[^/?]+/([^/?]+)', url)
+            if path_match:
+                path_id = path_match.group(1)
+                if path_id.isdigit():
+                    return f"xtid={path_id}$"
+            return None
+
+        # ORIGINAL: Old platform URL matching (JFK and any remaining old-format FOD)
         # First, try to match existing title IDs from MARC 028$a
         if title_ids:
             for title_id in title_ids:
                 title_id_clean = title_id.strip()
-                
+
                 # Skip if this looks like it's already formatted
                 if title_id_clean.startswith(('xtid=', 'customid=')):
                     continue
-                    
+
                 # Check if this title ID appears in the URL
                 # Look for pattern like "id=<title_id>&" or "customid=<title_id>&"
                 if f"id={title_id_clean}&" in url or f"customid={title_id_clean}&" in url:
@@ -395,11 +428,11 @@ class InfobaseMARCProcessor:
                     else:
                         # Skip this title ID if it doesn't match xtid= or customid= patterns
                         continue
-        
+
         # FALLBACK: If no title IDs in MARC 028$a, extract directly from URL
         # This handles cases where MARC 028$a is missing
         return self._extract_id_from_url(url)
-    
+
     def _extract_id_from_url(self, url: str) -> Optional[str]:
         """
         Extract title ID directly from URL when MARC 028$a is missing.
@@ -410,16 +443,32 @@ class InfobaseMARCProcessor:
             (r'[?&]customid=([^&]+)', 'customid='),
             (r'[?&]xtid=([^&]+)', 'xtid=')
         ]
-        
+
         for pattern, prefix in patterns:
             match = re.search(pattern, url)
             if match:
                 title_id = match.group(1)
                 return f"{prefix}{title_id}$"
-        
+
         # Don't extract from generic "id=" parameters
         return None
-    
+
+    def _extract_avod_title_id(self, url: str) -> str:
+        """
+        Extract the Access Video on Demand title ID from a new-format FOD URL.
+        Returns format/path_id (e.g., 'video/7384') for use in KBART output.
+        Returns empty string for JFK URLs or old-format FOD URLs.
+        
+        Example: 'https://access.infobase.com/video/7384?aid=256695' -> 'video/7384'
+        Handles all format types: video, audiobook, series, speech, podcast-episode
+        """
+        match = re.search(r'access\.infobase\.com/([^/?]+)/([^/?]+)', url, re.IGNORECASE)
+        if match:
+            format_type = match.group(1)  # e.g., 'video', 'audiobook', 'series'
+            path_id = match.group(2)       # e.g., '7384'
+            return f"{format_type}/{path_id}"
+        return ""
+
     def _determine_collection_type_with_fallback(self, record: Dict, original_lookup_data: Dict) -> str:
         """
         Determine collection type with fallback to original InfobaseLookup data.
@@ -429,9 +478,14 @@ class InfobaseMARCProcessor:
         # Method 1: Use MARC 856$z field if available (current MARC records)
         if 'url_description' in record and record['url_description']:
             url_descriptions = [record['url_description']]
-            collection_type = 'fod' if any('Films on Demand' in z for z in url_descriptions) else 'jfk'
+            collection_type = 'fod' if any(
+                'Films on Demand' in z
+                or 'FOD Collection' in z
+                or 'AVOD Collection' in z
+                for z in url_descriptions
+            ) else 'jfk'
             return collection_type
-        
+
         # Method 2: Fallback to original InfobaseLookup data (preserved records)
         if lookup_id in original_lookup_data:
             original_record = original_lookup_data[lookup_id]
@@ -441,7 +495,7 @@ class InfobaseMARCProcessor:
                     return 'fod'
                 elif lookup_id_collection.endswith('jfk'):
                     return 'jfk'
-                
+
         # Method 3: Default fallback
         return 'id_error'
     
@@ -829,6 +883,7 @@ class InfobaseMARCProcessor:
                 updated_df.loc[mask, 'title'] = record['title']
                 updated_df.loc[mask, 'collection_type'] = record['collection_type']  # Use MARC-derived collection type
                 updated_df.loc[mask, 'last_updated'] = datetime.now().strftime('%Y-%m-%d')
+                updated_df.loc[mask, 'avod_title_id'] = record.get('avod_title_id', '')
                 updates_applied += 1
                 logger.debug(f"Updated existing record: {lookup_id_collection}")
             else:
@@ -842,7 +897,8 @@ class InfobaseMARCProcessor:
                     'source': source,
                     'title': record['title'],
                     'collection_type': record['collection_type'],  # Use MARC-derived collection type
-                    'last_updated': datetime.now().strftime('%Y-%m-%d')
+                    'last_updated': datetime.now().strftime('%Y-%m-%d'),
+                    'avod_title_id': record.get('avod_title_id', '')
                 }
 
                 # Add new record to DataFrame
