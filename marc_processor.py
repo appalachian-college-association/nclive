@@ -1,4 +1,4 @@
-# marc_processor_v4.py
+# marc_processor.py
 """
 Automates MARC data processing to replace MarcEdit + OpenRefine workflow.
 Processes Films on Demand and Just for Kids MARC files to generate search terms
@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import logging
 from datetime import datetime
-from config import Config
 
 # MARC processing library
 try:
@@ -34,6 +33,18 @@ except ImportError:
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+_OCLC_DTYPES = {
+    'marcOCN': 'str',
+    'originalNCLiveOCN': 'str',
+    'verifiedOCN': 'str',
+    'oclcNumber': 'str',
+    'lookupID': 'str',
+    'lookupIDcollection': 'str',
+    'source': 'str',
+    'title': 'str',
+    'collection_type': 'str'
+}
 
 class InfobaseMARCProcessor:
     """
@@ -61,28 +72,6 @@ class InfobaseMARCProcessor:
         self.marc_dir = Path(marc_files_dir)
         self.kbart_dir = Path(kbart_dir)
         self.lookup_file = Path(lookup_file)
-
-        # Load OCLC dtypes configuration - handle missing credentials gracefully
-        try:
-            config = Config()
-            self.oclc_dtypes = config.OCLC_DTYPES
-        except ValueError as e:
-            if "Missing required environment variables" in str(e):
-                # Use default dtypes if credentials aren't available
-                logger.warning("Using default dtypes for CSV reading")
-                self.oclc_dtypes = {
-                    'marcOCN': 'str',
-                    'originalNCLiveOCN': 'str',
-                    'verifiedOCN': 'str',
-                    'oclcNumber': 'str',
-                    'lookupID': 'str',
-                    'lookupIDcollection': 'str',
-                    'source': 'str',
-                    'title': 'str',
-                    'collection_type': 'str'
-                }
-            else:
-                raise  # Re-raise if it's a different error
 
         # Create directories if they don't exist
         self.kbart_dir.mkdir(exist_ok=True)
@@ -119,6 +108,109 @@ class InfobaseMARCProcessor:
         """
         return text.replace('=', '%3D').replace('-', '%2D')
 
+    def _resolve_verified_ocn_col(self, df: pd.DataFrame) -> str:
+        """Return verified OCN column name, falling back to auto-detection."""
+        col_name = 'verifiedOCN'
+        if col_name in df.columns:
+            logger.info("Using expected column: %s", col_name)
+            return col_name
+        logger.warning("Could not find 'verifiedOCN' column in InfobaseLookup.csv")
+        logger.info("Available columns: %s", ", ".join(df.columns))
+        for col in df.columns:
+            col_lower = col.lower()
+            if 'verified' in col_lower and 'ocn' in col_lower:
+                col_name = col
+                break
+            if 'oclc' in col_lower and ('number' in col_lower or 'num' in col_lower):
+                col_name = col
+                break
+        logger.warning("Using fallback column: %s", col_name)
+        return col_name
+
+    def _extract_original_nclive_ocn(self, row: pd.Series, df_columns) -> str:
+        """Extract original NC Live OCN from a lookup row."""
+        if 'originalNCLiveOCN' in df_columns:
+            return str(row.get('originalNCLiveOCN', '')).strip()
+        if 'InfobaseMRCkey_original' in df_columns:
+            mrc_key = str(row.get('InfobaseMRCkey_original', '')).strip()
+            if '|' in mrc_key:
+                return mrc_key.split('|', maxsplit=1)[0].strip()
+        return ""
+
+    def _load_lookup_file(self) -> None:
+        """Load primary authority data from InfobaseLookup.csv into infobase_lookup."""
+        if not self.lookup_file.exists():
+            logger.warning("InfobaseLookup file not found: %s", self.lookup_file)
+            return
+        try:
+            df = pd.read_csv(self.lookup_file, dtype=_OCLC_DTYPES, keep_default_na=False)
+            logger.info("InfobaseLookup columns found: %s", list(df.columns))
+            verified_ocn_col = self._resolve_verified_ocn_col(df)
+            lookup_id_col = 'lookupID'
+            if verified_ocn_col not in df.columns or lookup_id_col not in df.columns:
+                return
+            for _, row in df.iterrows():
+                lookup_id = str(row.get(lookup_id_col, '')).strip()
+                verified_ocn = str(row.get(verified_ocn_col, '')).strip()
+                if not (lookup_id and verified_ocn and
+                        verified_ocn.lower() not in ('', 'x', 'nan', 'null')):
+                    continue
+                self.infobase_lookup[lookup_id] = {
+                    'verified_ocn': verified_ocn,
+                    'original_nclive_ocn': self._extract_original_nclive_ocn(row, df.columns)
+                }
+            logger.info(
+                "PRIMARY: Loaded %s manually verified entries from InfobaseLookup.csv",
+                len(self.infobase_lookup)
+            )
+        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError) as e:
+            logger.warning("Could not load InfobaseLookup file: %s", e)
+
+    def _find_kbart_columns(self, df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+        """Return (title_id_col, oclc_col) from a KBART DataFrame, or (None, None)."""
+        title_id_col = None
+        oclc_col = None
+        for col in df.columns:
+            col_lower = col.lower()
+            if 'title_id' in col_lower or 'titleid' in col_lower:
+                title_id_col = col
+            elif 'oclc' in col_lower and ('number' in col_lower or 'num' in col_lower):
+                oclc_col = col
+        return title_id_col, oclc_col
+
+    def _load_kbart_file(self, kbart_file: Path) -> int:
+        """Load one KBART file into kbart_lookup; return count of new entries added."""
+        try:
+            df = pd.read_csv(kbart_file, sep='\t', low_memory=False)
+            title_id_col, oclc_col = self._find_kbart_columns(df)
+            count = 0
+            if title_id_col and oclc_col:
+                for _, row in df.iterrows():
+                    title_id_encoded = str(row.get(title_id_col, '')).strip()
+                    oclc_num = str(row.get(oclc_col, '')).strip()
+                    if not (title_id_encoded and oclc_num and
+                            oclc_num.lower() not in ('', 'nan', 'null')):
+                        continue
+                    title_id_decoded = self._decode_url_encoding(title_id_encoded)
+                    if title_id_decoded.startswith(('xtid=', 'customid=')):
+                        lookup_id_format = f"{title_id_decoded}$"
+                        numeric_id = title_id_decoded.split('=', maxsplit=1)[-1]
+                    else:
+                        lookup_id_format = f"customid={title_id_decoded}$"
+                        numeric_id = title_id_decoded
+                    if lookup_id_format not in self.infobase_lookup:
+                        self.kbart_lookup[numeric_id] = {
+                            'oclc_number': oclc_num,
+                            'encoded_title_id': title_id_encoded,
+                            'decoded_title_id': title_id_decoded
+                        }
+                        count += 1
+            logger.info("SECONDARY: Loaded %s entries from %s", len(df), kbart_file.name)
+            return count
+        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError) as e:
+            logger.warning("Could not load KBART file %s: %s", kbart_file, e)
+            return 0
+
     def load_existing_data(self):
         """
         Load existing lookup data with hierarchical priority:
@@ -126,128 +218,38 @@ class InfobaseMARCProcessor:
         2. KBART files (SECONDARY)
         """
         logger.info("Loading existing lookup data with hierarchical priority...")
-
-        # PRIMARY: Load InfobaseLookup.csv (manually verified matches)
-        if self.lookup_file.exists():
-            try:
-                df = pd.read_csv(self.lookup_file, dtype=self.oclc_dtypes, keep_default_na=False)
-                logger.info("InfobaseLookup columns found: %s", list(df.columns))
-
-                # Based on your sample structure, use 'verifiedOCN' column
-                verified_ocn_col = 'verifiedOCN'
-                lookup_id_col = 'lookupID'
-
-                if verified_ocn_col not in df.columns:
-                    logger.warning("Could not find 'verifiedOCN' column in InfobaseLookup.csv")
-                    logger.info("Available columns: %s", ", ".join(df.columns))
-                    # Fallback to automatic detection
-                    for col in df.columns:
-                        col_lower = col.lower()
-                        if 'verified' in col_lower and 'ocn' in col_lower:
-                            verified_ocn_col = col
-                            break
-                        elif 'oclc' in col_lower and ('number' in col_lower or 'num' in col_lower):
-                            verified_ocn_col = col
-                            break
-                    logger.warning("Using fallback column: %s", verified_ocn_col)
-                else:
-                    logger.info("Using expected column: %s", verified_ocn_col)
-
-                if verified_ocn_col in df.columns and lookup_id_col in df.columns:
-                    # Create lookup dictionary: lookupID -> verified OCLC number
-                    for _, row in df.iterrows():
-                        lookup_id = str(row.get(lookup_id_col, '')).strip()
-                        verified_ocn = str(row.get(verified_ocn_col, '')).strip()
-
-                        # Also capture original NC Live OCN if available for comparison
-                        original_nclive_ocn = ""
-                        if 'originalNCLiveOCN' in df.columns:
-                            original_nclive_ocn = str(row.get('originalNCLiveOCN', '')).strip()
-                        elif 'InfobaseMRCkey_original' in df.columns:
-                            # Parse pipe-delimited format: "OCN|lookupID"
-                            mrc_key = str(row.get('InfobaseMRCkey_original', '')).strip()
-                            if '|' in mrc_key:
-                                original_nclive_ocn = mrc_key.split('|',maxsplit=1)[0].strip()
-
-                        # Only store valid, verified OCLC numbers (not empty or NaN)
-                        # Your data uses integers, so handle both int and string formats
-                        if (lookup_id and verified_ocn and
-                            verified_ocn.lower() not in ['', 'X', 'x', 'nan', 'null'] and
-                            str(verified_ocn) != 'nan'):
-                            # Store both verified OCN and original for comparison
-                            self.infobase_lookup[lookup_id] = {
-                                'verified_ocn': verified_ocn,
-                                'original_nclive_ocn': original_nclive_ocn
-                            }
-
-                    logger.info(
-                        "PRIMARY: Loaded %s manually verified entries from InfobaseLookup.csv",
-                                len(self.infobase_lookup)
-                                )
-
-            except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError) as e:
-                logger.warning("Could not load InfobaseLookup file: %s", e)
-        else:
-            logger.warning("InfobaseLookup file not found: %s", self.lookup_file)
-
-        # SECONDARY: Load current KBART files
-        kbart_records_loaded = 0
-        for kbart_file in self.kbart_dir.glob("*.txt"):
-            try:
-                df = pd.read_csv(kbart_file, sep='\t', low_memory=False)
-
-                # Handle different possible column names in KBART files
-                title_id_col = None
-                oclc_col = None
-
-                for col in df.columns:
-                    col_lower = col.lower()
-                    if 'title_id' in col_lower or 'titleid' in col_lower:
-                        title_id_col = col
-                    elif 'oclc' in col_lower and ('number' in col_lower or 'num' in col_lower):
-                        oclc_col = col
-
-                if title_id_col and oclc_col:
-                    for _, row in df.iterrows():
-                        title_id_encoded = str(row.get(title_id_col, '')).strip()
-                        oclc_num = str(row.get(oclc_col, '')).strip()
-
-                        if (title_id_encoded and oclc_num and
-                            oclc_num.lower() not in ['', 'nan', 'null']):
-
-                            # DECODE the percent-encoded title_id for matching
-                            title_id_decoded = self._decode_url_encoding(title_id_encoded)
-
-                            # Create lookup ID format to match InfobaseLookup format
-                            # Convert from xtid%3D184316 to xtid=184316$
-                            if title_id_decoded.startswith(('xtid=', 'customid=')):
-                                lookup_id_format = f"{title_id_decoded}$"
-                                # Extract numeric ID for storage key
-                                numeric_id = title_id_decoded.split('=', maxsplit=1)[-1]
-                            else:
-                                # Handle cases where it might be just the numeric ID
-                                lookup_id_format = f"customid={title_id_decoded}$"
-                                numeric_id = title_id_decoded
-
-                            # Only store if not already in primary lookup
-                            if lookup_id_format not in self.infobase_lookup:
-                                self.kbart_lookup[numeric_id] = {
-                                    'oclc_number': oclc_num,
-                                    'encoded_title_id': title_id_encoded,
-                                    'decoded_title_id': title_id_decoded   # Decoded for matching
-                                }
-                                kbart_records_loaded += 1
-
-                logger.info("SECONDARY: Loaded %s entries from %s", len(df), kbart_file.name)
-
-            except (
-                (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError)
-            ) as e:
-                logger.warning("Could not load KBART file %s: %s", kbart_file, e)
-
+        self._load_lookup_file()
+        kbart_records_loaded = sum(
+            self._load_kbart_file(f) for f in self.kbart_dir.glob("*.txt")
+        )
         logger.info("SECONDARY: Total unique KBART records loaded: %s", kbart_records_loaded)
         logger.info("TOTAL AUTHORITY RECORDS: %s (primary) + %s (secondary)",
                     len(self.infobase_lookup), len(self.kbart_lookup))
+
+    def _extract_numeric_title_id(self, field_028_a: List[str]) -> str:
+        """Extract the first numeric title ID from 028$a values."""
+        if not field_028_a:
+            return "Unknown"
+        first_title_id = field_028_a[0].strip()
+        if first_title_id.isdigit():
+            return first_title_id
+        numeric_match = re.search(r'\d+', first_title_id)
+        return numeric_match.group() if numeric_match else "Unknown"
+
+    def _build_rejection_info(self, record: Record) -> dict:
+        """Build a rejection-tracking entry for a record that failed title ID validation."""
+        control_001 = record['001'].data if record['001'] else "Unknown"
+        field_245_a = self._get_subfield_values(record, '245', 'a')
+        field_028_a = self._get_subfield_values(record, '028', 'a')
+        field_856_u = self._get_subfield_values(record, '856', 'u')
+        return {
+            'nc_live_title_id': self._extract_numeric_title_id(field_028_a),
+            'control_001': control_001,
+            'title': field_245_a[0] if field_245_a else "No title found",
+            'reason': 'Failed title ID validation or URL matching',
+            'raw_title_ids': field_028_a,
+            'url': field_856_u[0] if field_856_u else "No URL"
+        }
 
     def extract_marc_fields(self, marc_file: Path) -> List[Dict]:
         """
@@ -256,88 +258,52 @@ class InfobaseMARCProcessor:
         Returns list of dictionaries with extracted field data.
         """
         records = []
-
         try:
             with open(marc_file, 'rb') as file:
                 reader = MARCReader(file)
-
                 for record in reader:
                     if record is None:
                         continue
-
                     self.stats['total_processed'] += 1
-
-                    # Extract fields following your OpenRefine logic
                     record_data = self._extract_record_fields(record)
-
                     if record_data:
                         records.append(record_data)
                     else:
-                        # Track rejected records with detailed info
-                        control_001 = record['001'].data if record['001'] else "Unknown"
-                        field_245_a = self._get_subfield_values(record, '245', 'a')
-                        title = field_245_a[0] if field_245_a else "No title found"
-                        field_028_a = self._get_subfield_values(record, '028', 'a')
-                        field_856_u = self._get_subfield_values(record, '856', 'u')
-
-                        # Extract numeric title ID for tracking
-                        title_id_numeric = "Unknown"
-                        if field_028_a:
-                            first_title_id = field_028_a[0].strip()
-                            if first_title_id.isdigit():
-                                title_id_numeric = first_title_id
-                            else:
-                                numeric_match = re.search(r'\d+', first_title_id)
-                                if numeric_match:
-                                    title_id_numeric = numeric_match.group()
-
-                        rejection_info = {
-                            'nc_live_title_id': title_id_numeric,
-                            'control_001': control_001,
-                            'title': title,
-                            'reason': 'Failed title ID validation or URL matching',
-                            'raw_title_ids': field_028_a,
-                            'url': field_856_u[0] if field_856_u else "No URL"
-                        }
-
-                        self.stats['rejected_records'].append(rejection_info)
-
+                        self.stats['rejected_records'].append(
+                            self._build_rejection_info(record)
+                        )
         except (OSError, PymarcException) as e:
             logger.error("Error reading MARC file %s: %s", marc_file, e)
-
         logger.info("Extracted %s valid records from %s", len(records), marc_file.name)
         return records
+
+    def _parse_title_ids(self, field_028_a: List[str]) -> List[str]:
+        """Expand semicolon-separated 028$a values into a flat list of stripped IDs."""
+        title_ids = []
+        for value in field_028_a:
+            if ';' in value:
+                title_ids.extend(v.strip() for v in value.split(';'))
+            else:
+                title_ids.append(value.strip())
+        return title_ids
 
     def _extract_record_fields(self, record: Record) -> Optional[Dict]:
         """Extract and process fields from a single MARC record."""
         try:
-            # Extract key fields (following exportMARCsearch.txt specification)
             control_001 = record['001'].data if record['001'] else ""
-            field_028_a = self._get_subfield_values(record, '028', 'a')  # Title IDs
-            _field_245_c = self._get_subfield_values(record, '245', 'c') # Publisher lookup
-            field_035_a = self._get_subfield_values(record, '035', 'a')  # OCLC numbers
-            field_245_a = self._get_subfield_values(record, '245', 'a')  # Title
-            field_856_u = self._get_subfield_values(record, '856', 'u')  # URLs
-            field_856_z = self._get_subfield_values(record, '856', 'z')  # URL descriptions
+            field_028_a = self._get_subfield_values(record, '028', 'a')
+            field_035_a = self._get_subfield_values(record, '035', 'a')
+            field_245_a = self._get_subfield_values(record, '245', 'a')
+            field_856_u = self._get_subfield_values(record, '856', 'u')
+            field_856_z = self._get_subfield_values(record, '856', 'z')
 
-            # Process 028$a field (title IDs) - can contain multiple IDs separated by semicolons
-            title_ids = []
-            for value in field_028_a:
-                if ';' in value:
-                    title_ids.extend([id.strip() for id in value.split(';')])
-                else:
-                    title_ids.append(value.strip())
-
-            # Find the correct title ID by matching with 856$u URL
+            title_ids = self._parse_title_ids(field_028_a)
             lookup_id = self._validate_title_id_with_url(title_ids, field_856_u)
 
             if not lookup_id:
                 return None
 
-            # Extract and clean OCLC number from 035$a (TERTIARY source)
             marc_035_ocn = self._extract_oclc_number(field_035_a, title_ids)
-
-            # Determine collection type
             collection_type = 'fod' if any(
                 'Films on Demand' in z
                 or 'FOD Collection' in z
@@ -345,16 +311,13 @@ class InfobaseMARCProcessor:
                 for z in field_856_z
             ) else 'jfk'
             lookup_id_collection = f"{lookup_id}{collection_type}"
-
-            # Extract avod_title_id for new Access Video on Demand FOD records
-            # Returns format/path_id (e.g., 'video/7384'); empty string for JFK and old-format FOD
             avod_title_id = self._extract_avod_title_id(field_856_u[0]) if field_856_u else ""
 
-            record_data = {
+            return {
                 'control_001': control_001,
                 'lookup_id': lookup_id,
                 'lookup_id_collection': lookup_id_collection,
-                'marc_035_ocn': marc_035_ocn,  # TERTIARY: OCN from MARC (unreliable)
+                'marc_035_ocn': marc_035_ocn,
                 'title': field_245_a[0] if field_245_a else "",
                 'url': field_856_u[0] if field_856_u else "",
                 'collection_type': collection_type,
@@ -362,8 +325,6 @@ class InfobaseMARCProcessor:
                 'url_description': field_856_z[0] if field_856_z else "",
                 'avod_title_id': avod_title_id
             }
-
-            return record_data
 
         except (AttributeError, KeyError, TypeError, ValueError) as e:
             logger.warning("Error processing record: %s", e)
@@ -380,6 +341,43 @@ class InfobaseMARCProcessor:
             values.extend(subfields)
         return values
 
+    def _validate_avod_title_id(
+            self, title_ids: List[str], url: str
+    ) -> Optional[str]:
+        """Return a lookup ID for an access.infobase.com URL.
+
+        Uses 028$a xtid directly (URL cross-validation not possible on the new platform).
+        Falls back to the path segment when 028$a is absent.
+        """
+        for title_id in title_ids:
+            title_id_clean = title_id.strip()
+            if title_id_clean.isdigit():
+                return f"xtid={title_id_clean}$"
+        path_match = re.search(r'access\.infobase\.com/[^/?]+/([^/?]+)', url)
+        if path_match:
+            path_id = path_match.group(1)
+            if path_id.isdigit():
+                return f"xtid={path_id}$"
+        return None
+
+    def _match_title_id_in_url(
+            self, title_ids: List[str], url: str
+    ) -> Optional[str]:
+        """Match a 028$a title ID against the 856$u URL for old-platform records.
+
+        Returns a formatted lookup ID string, or None if no match found.
+        """
+        for title_id in title_ids:
+            title_id_clean = title_id.strip()
+            if title_id_clean.startswith(('xtid=', 'customid=')):
+                continue
+            if f"id={title_id_clean}&" in url or f"customid={title_id_clean}&" in url:
+                if "xtid=" in url:
+                    return f"xtid={title_id_clean}$"
+                if "customid=" in url:
+                    return f"customid={title_id_clean}$"
+        return None
+
     def _validate_title_id_with_url(
             self, title_ids: List[str], urls: List[str]
     ) -> Optional[str]:
@@ -395,51 +393,12 @@ class InfobaseMARCProcessor:
         """
         if not urls:
             return None
-
-        url = urls[0].lower()  # Convert to lowercase for matching
-
-        # NEW: Access Video on Demand platform detection (new FOD URLs)
-        # The 028$a value is still the old xtid but does not appear in the new URL,
-        # so URL cross-validation is skipped for these records.
-        # If 028$a is absent entirely, fall back to the path_id from the URL itself.
+        url = urls[0].lower()
         if 'access.infobase.com' in url:
-            if title_ids:
-                for title_id in title_ids:
-                    title_id_clean = title_id.strip()
-                    if title_id_clean.isdigit():
-                        return f"xtid={title_id_clean}$"
-            # No 028$a available: extract path_id from the URL as the identifier
-            path_match = re.search(r'access\.infobase\.com/[^/?]+/([^/?]+)', url)
-            if path_match:
-                path_id = path_match.group(1)
-                if path_id.isdigit():
-                    return f"xtid={path_id}$"
-            return None
-
-        # ORIGINAL: Old platform URL matching (JFK and any remaining old-format FOD)
-        # First, try to match existing title IDs from MARC 028$a
-        if title_ids:
-            for title_id in title_ids:
-                title_id_clean = title_id.strip()
-
-                # Skip if this looks like it's already formatted
-                if title_id_clean.startswith(('xtid=', 'customid=')):
-                    continue
-
-                # Check if this title ID appears in the URL
-                # Look for pattern like "id=<title_id>&" or "customid=<title_id>&"
-                if f"id={title_id_clean}&" in url or f"customid={title_id_clean}&" in url:
-                    # Determine the correct prefix based on URL content
-                    if "xtid=" in url:
-                        return f"xtid={title_id_clean}$"
-                    elif "customid=" in url:
-                        return f"customid={title_id_clean}$"
-                    else:
-                        # Skip this title ID if it doesn't match xtid= or customid= patterns
-                        continue
-
-        # FALLBACK: If no title IDs in MARC 028$a, extract directly from URL
-        # This handles cases where MARC 028$a is missing
+            return self._validate_avod_title_id(title_ids, url)
+        result = self._match_title_id_in_url(title_ids, url)
+        if result:
+            return result
         return self._extract_id_from_url(url)
 
     def _extract_id_from_url(self, url: str) -> Optional[str]:
@@ -504,7 +463,7 @@ class InfobaseMARCProcessor:
                 lookup_id_collection = original_record.get('lookupIDcollection', '')
                 if lookup_id_collection.endswith('fod'):
                     return 'fod'
-                elif lookup_id_collection.endswith('jfk'):
+                if lookup_id_collection.endswith('jfk'):
                     return 'jfk'
 
         # Method 3: Default fallback
@@ -769,211 +728,151 @@ class InfobaseMARCProcessor:
 
         return changes
 
-    def create_updated_lookup_file(self, oclc_results_file: str = "oclc_results.csv",
-                                   output_file: str = "InfobaseLookup_updated.csv"):
-        """
-        Create updated InfobaseLookup file by merging existing data with new OCLC search results.
-        FIXED VERSION - Handles duplicate title_IDs in different collections correctly.
-        """
-        logger.info("Creating updated lookup file...")
+    def _get_original_nclive_ocn(self, lookup_id: str) -> str:
+        """Return the original NC Live OCN for a lookup_id, or empty string."""
+        lookup_data = self.infobase_lookup.get(lookup_id)
+        if isinstance(lookup_data, dict):
+            return lookup_data.get('original_nclive_ocn', '')
+        return ""
 
-        # Load OCLC search results and handle multiple entries per lookupID
-        new_oclc_data = {}
+    def _resolve_verified_ocn_and_source(
+            self, record: Dict, new_oclc_data: dict
+    ) -> Tuple[str, str]:
+        """Determine the final verified OCN and its source label for a MARC record."""
+        verified_ocn, source = self._determine_best_oclc_number(record)
+        if source != "NEEDS_SEARCH":
+            return verified_ocn, source
+        lookup_id = record['lookup_id']
+        if lookup_id in new_oclc_data:
+            return new_oclc_data[lookup_id], "API_SEARCH"
+        logger.warning("No API result found for %s, marking for manual review", lookup_id)
+        return "X", "MANUAL_REVIEW"
+
+    def _load_oclc_results(self, oclc_results_file: str) -> dict:
+        """Load oclc_results.csv and return {base_lookup_id: oclc_number}."""
         oclc_results_path = Path(oclc_results_file)
-
-        if oclc_results_path.exists():
-            try:
-                logger.info("Loading OCLC search results from %s", oclc_results_file)
-                results_df = pd.read_csv(
-                    oclc_results_file, dtype={'oclcNumber': 'str', 'lookupID': 'str'}
-                )
-
-                # Group by lookupID to handle multiple OCLC numbers per lookup
-                lookup_groups = results_df.groupby('lookupID')
-
-                for lookup_id_from_csv, group in lookup_groups:
-                    # Extract base lookupID from OCLC results
-                    # Convert "xtid=296591$fod" -> "xtid=296591$"
-                    if lookup_id_from_csv.endswith(('$fod', '$jfk')):
-                        base_lookup_id = lookup_id_from_csv[:-3]  # Remove suffix, keep $
-                    else:
-                        base_lookup_id = lookup_id_from_csv
-
-                    if len(group) == 1:
-                        # Single OCLC number - use it directly
-                        oclc_number = str(group.iloc[0]['oclcNumber']).strip()
-                        new_oclc_data[base_lookup_id] = oclc_number
-                        logger.debug("Single match for %s: %s", base_lookup_id, oclc_number)
-                    else:
-                        # Multiple OCLC numbers - select best match
-                        best_oclc = self._select_best_oclc_from_multiple(base_lookup_id, group)
-                        if best_oclc:
-                            new_oclc_data[base_lookup_id] = best_oclc
-                            logger.info(
-                                "Multiple matches for %s, selected: %s", base_lookup_id, best_oclc
-                            )
-                        else:
-                            logger.warning("Could not select best OCLC for %s from %s options",
-                                           base_lookup_id, len(group))
-
-                logger.info("Processed %s OCLC search results", len(new_oclc_data))
-                logger.info("Sample lookup keys: %s", list(new_oclc_data.keys())[:5])  # Debug info
-
-            except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError) as e:
-                logger.error("Error loading OCLC results: %s", e)
-                new_oclc_data = {}
-        else:
+        if not oclc_results_path.exists():
             logger.warning("OCLC results file not found: %s", oclc_results_file)
-
-        # Load original lookup file to preserve existing records
+            return {}
         try:
-            original_df = pd.read_csv(
-                self.lookup_file, dtype=self.oclc_dtypes, keep_default_na=False
+            logger.info("Loading OCLC search results from %s", oclc_results_file)
+            results_df = pd.read_csv(
+                oclc_results_file, dtype={'oclcNumber': 'str', 'lookupID': 'str'}
             )
-            logger.info("Loaded %s original records from %s", len(original_df), self.lookup_file)
-        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
-            logger.error("Could not load original lookup file: %s", e)
-            return None
+            new_oclc_data = {}
+            for lookup_id_from_csv, group in results_df.groupby('lookupID'):
+                base_lookup_id = (
+                    lookup_id_from_csv[:-3]
+                    if lookup_id_from_csv.endswith(('$fod', '$jfk'))
+                    else lookup_id_from_csv
+                )
+                if len(group) == 1:
+                    oclc_number = str(group.iloc[0]['oclcNumber']).strip()
+                    new_oclc_data[base_lookup_id] = oclc_number
+                    logger.debug("Single match for %s: %s", base_lookup_id, oclc_number)
+                else:
+                    best_oclc = self._select_best_oclc_from_multiple(base_lookup_id, group)
+                    if best_oclc:
+                        new_oclc_data[base_lookup_id] = best_oclc
+                        logger.info(
+                            "Multiple matches for %s, selected: %s", base_lookup_id, best_oclc
+                        )
+                    else:
+                        logger.warning(
+                            "Could not select best OCLC for %s from %s options",
+                            base_lookup_id, len(group)
+                        )
+            logger.info("Processed %s OCLC search results", len(new_oclc_data))
+            logger.info("Sample lookup keys: %s", list(new_oclc_data.keys())[:5])
+            return new_oclc_data
+        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError) as e:
+            logger.error("Error loading OCLC results: %s", e)
+            return {}
 
-        # Start with ALL original records (CRITICAL: preserves existing data)
-        updated_df = original_df.copy()
-
-        # Create a set of lookupIDcollections from current MARC processing for updates
-        current_lookup_id_collections = {
-            record['lookup_id_collection'] for record in self.current_records
-        }
-        logger.info("Current MARC processing covers %s lookupIDcollection entries",
-                    len(current_lookup_id_collections))
-
-        # Create a mapping of current MARC records by lookupIDcollection for easy access
-        current_marc_records = {
-            record['lookup_id_collection']: record for record in self.current_records
-        }
-
-        # FIXED: Only update records that match both lookupID AND collection type
-        logger.info("Applying updates using lookupIDcollection as the primary key...")
-        collection_type_fixes = 0
-
-        # Mark records that need updates (matching current MARC processing)
-        updated_df['needs_update'] = (
-            updated_df['lookupIDcollection'].isin(current_lookup_id_collections)
-        )
-
+    def _fix_collection_types(
+            self, updated_df: pd.DataFrame, current_marc_records: dict
+    ) -> Tuple[pd.DataFrame, int]:
+        """Update collection_type to match current MARC files; return (df, fix_count)."""
+        count = 0
         for index, row in updated_df.iterrows():
             lookup_id_collection = str(row.get('lookupIDcollection', '')).strip()
+            if lookup_id_collection not in current_marc_records:
+                continue
+            current_collection_type = str(row.get('collection_type', '')).strip()
+            marc_collection_type = current_marc_records[lookup_id_collection]['collection_type']
+            if current_collection_type != marc_collection_type:
+                updated_df.at[index, 'collection_type'] = marc_collection_type
+                updated_df.at[index, 'last_updated'] = datetime.now().strftime('%Y-%m-%d')
+                count += 1
+                logger.info(
+                    "Updated collection_type for %s: '%s' -> '%s' (from current MARC)",
+                    lookup_id_collection, current_collection_type, marc_collection_type
+                )
+        return updated_df, count
 
-            # ONLY process records that are in the current MARC processing
-            if lookup_id_collection in current_marc_records:
-                current_collection_type = str(row.get('collection_type', '')).strip()
-                marc_record = current_marc_records[lookup_id_collection]
-                marc_collection_type = marc_record['collection_type']
-
-                # Update collection type to match what's in the current MARC files
-                if current_collection_type != marc_collection_type:
-                    updated_df.at[index, 'collection_type'] = marc_collection_type
-                    updated_df.at[index, 'last_updated'] = datetime.now().strftime('%Y-%m-%d')
-                    collection_type_fixes += 1
-                    logger.info("Updated collection_type for %s: '%s' -> '%s' (from current MARC)",
-                                lookup_id_collection,
-                                current_collection_type,
-                                marc_collection_type
-                                )
-
-        logger.info("Applied collection type fixes to %s records", collection_type_fixes)
-
-        # Process updates for records from current MARC processing
+    def _apply_marc_updates(
+            self, updated_df: pd.DataFrame, new_oclc_data: dict
+    ) -> Tuple[pd.DataFrame, dict]:
+        """Apply current MARC records to updated_df; return (df, counts dict)."""
         updates_applied = 0
         new_records_added = 0
         api_matches_found = 0
-
+        today = datetime.now().strftime('%Y-%m-%d')
         for record in self.current_records:
-            lookup_id = record['lookup_id']  # Format "xtid=296591$"
-            lookup_id_collection = record['lookup_id_collection']  # Format "xtid=296591$fod"
-            marc_035_ocn = record['marc_035_ocn']
-
-            # Use hierarchical lookup FIRST, then check for new API results
-            verified_ocn, source = self._determine_best_oclc_number(record)
-
-            # Get original NC LIVE OCN for comparison
-            original_nclive_ocn = ""
-            if lookup_id in self.infobase_lookup and isinstance(
-                self.infobase_lookup[lookup_id], dict
-            ):
-                original_nclive_ocn = self.infobase_lookup[lookup_id].get(
-                    'original_nclive_ocn', ''
-                )
-
-            # If hierarchical lookup found nothing, check new API results
-            if source == "NEEDS_SEARCH":
-                # Use the base lookup_id (already in correct format)
-                if lookup_id in new_oclc_data:
-                    verified_ocn = new_oclc_data[lookup_id]
-                    source = "API_SEARCH"
-                    api_matches_found += 1
-                    logger.info("Using API result for %s: %s", lookup_id, verified_ocn)
-                else:
-                    verified_ocn = "X"  # Mark for manual review
-                    source = "MANUAL_REVIEW"
-                    logger.warning(
-                        "No API result found for %s, marking for manual review", lookup_id
-                    )
-
-            # FIXED: Use lookupIDcollection as the unique key instead of just lookupID
+            lookup_id = record['lookup_id']
+            lookup_id_collection = record['lookup_id_collection']
+            verified_ocn, source = self._resolve_verified_ocn_and_source(record, new_oclc_data)
+            if source == "API_SEARCH":
+                api_matches_found += 1
+                logger.info("Using API result for %s: %s", lookup_id, verified_ocn)
+            original_nclive_ocn = self._get_original_nclive_ocn(lookup_id)
             mask = updated_df['lookupIDcollection'] == lookup_id_collection
             if mask.any():
-                # Update existing record with data from current MARC processing
                 updated_df.loc[mask, 'originalNCLiveOCN'] = original_nclive_ocn
-                updated_df.loc[mask, 'marcOCN'] = marc_035_ocn
+                updated_df.loc[mask, 'marcOCN'] = record['marc_035_ocn']
                 updated_df.loc[mask, 'verifiedOCN'] = verified_ocn
                 updated_df.loc[mask, 'source'] = source
                 updated_df.loc[mask, 'title'] = record['title']
                 updated_df.loc[mask, 'collection_type'] = record['collection_type']
-                updated_df.loc[mask, 'last_updated'] = datetime.now().strftime('%Y-%m-%d')
+                updated_df.loc[mask, 'last_updated'] = today
                 updated_df.loc[mask, 'avod_title_id'] = record.get('avod_title_id', '')
                 updates_applied += 1
                 logger.debug("Updated existing record: %s", lookup_id_collection)
             else:
-                # New record not in original lookup - add it
                 new_record = {
                     'lookupID': lookup_id,
-                    'lookupIDcollection': lookup_id_collection,  # This is the unique key
+                    'lookupIDcollection': lookup_id_collection,
                     'originalNCLiveOCN': original_nclive_ocn,
-                    'marcOCN': marc_035_ocn,
+                    'marcOCN': record['marc_035_ocn'],
                     'verifiedOCN': verified_ocn,
                     'source': source,
                     'title': record['title'],
-                    # Use MARC-derived collection type
                     'collection_type': record['collection_type'],
-                    'last_updated': datetime.now().strftime('%Y-%m-%d'),
+                    'last_updated': today,
                     'avod_title_id': record.get('avod_title_id', '')
                 }
-
-                # Add new record to DataFrame
-                updated_df = pd.concat([updated_df, pd.DataFrame([new_record])], ignore_index=True)
+                updated_df = pd.concat(
+                    [updated_df, pd.DataFrame([new_record])], ignore_index=True
+                )
                 new_records_added += 1
                 logger.debug("Added new record: %s", lookup_id_collection)
+        return updated_df, {
+            'updates_applied': updates_applied,
+            'new_records_added': new_records_added,
+            'api_matches_found': api_matches_found
+        }
 
-        # Clean up the temporary column
-        updated_df = updated_df.drop('needs_update', axis=1)
-
-        logger.info("Applied updates to %s existing records", updates_applied)
-        logger.info("Added %s new records", new_records_added)
-        logger.info("Found %s API matches from OCLC results", api_matches_found)
-        logger.info("Updated lookup file has %s records", len(updated_df))
-
-        # DIAGNOSTIC: Show collection type distribution and duplicate analysis
+    def _log_lookup_diagnostics(self, updated_df: pd.DataFrame) -> None:
+        """Log collection type distribution and duplicate analysis for the lookup file."""
         collection_counts = updated_df['collection_type'].value_counts()
         logger.info("Current collection type distribution: %s", collection_counts.to_dict())
-
-        # Check for duplicates by lookupID (should be expected for titles in both collections)
         lookup_id_counts = updated_df['lookupID'].value_counts()
         duplicates = lookup_id_counts[lookup_id_counts > 1]
         if len(duplicates) > 0:
-            logger.info("Found %s title IDs in multiple collections (this is expected)",
-                        len(duplicates))
+            logger.info(
+                "Found %s title IDs in multiple collections (this is expected)", len(duplicates)
+            )
             logger.info("Sample duplicates: %s", duplicates.head().to_dict())
-
-        # Verify no duplicates by lookupIDcollection (this would be an error)
         collection_id_counts = updated_df['lookupIDcollection'].value_counts()
         collection_duplicates = collection_id_counts[collection_id_counts > 1]
         if len(collection_duplicates) > 0:
@@ -982,7 +881,37 @@ class InfobaseMARCProcessor:
         else:
             logger.info("✅ No duplicate lookupIDcollection entries - data integrity maintained")
 
-        # Save updated lookup file
+    def create_updated_lookup_file(self, oclc_results_file: str = "oclc_results.csv",
+                                   output_file: str = "InfobaseLookup_updated.csv"):
+        """
+        Create updated InfobaseLookup file by merging existing data with new OCLC search results.
+        FIXED VERSION - Handles duplicate title_IDs in different collections correctly.
+        """
+        logger.info("Creating updated lookup file...")
+        new_oclc_data = self._load_oclc_results(oclc_results_file)
+        try:
+            original_df = pd.read_csv(
+                self.lookup_file, dtype=_OCLC_DTYPES, keep_default_na=False
+            )
+            logger.info("Loaded %s original records from %s", len(original_df), self.lookup_file)
+        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+            logger.error("Could not load original lookup file: %s", e)
+            return None
+        updated_df = original_df.copy()
+        current_marc_records = {r['lookup_id_collection']: r for r in self.current_records}
+        logger.info("Current MARC processing covers %s lookupIDcollection entries",
+                    len(current_marc_records))
+        logger.info("Applying updates using lookupIDcollection as the primary key...")
+        updated_df, collection_type_fixes = self._fix_collection_types(
+            updated_df, current_marc_records
+        )
+        logger.info("Applied collection type fixes to %s records", collection_type_fixes)
+        updated_df, counts = self._apply_marc_updates(updated_df, new_oclc_data)
+        logger.info("Applied updates to %s existing records", counts['updates_applied'])
+        logger.info("Added %s new records", counts['new_records_added'])
+        logger.info("Found %s API matches from OCLC results", counts['api_matches_found'])
+        logger.info("Updated lookup file has %s records", len(updated_df))
+        self._log_lookup_diagnostics(updated_df)
         updated_df.to_csv(output_file, index=False)
         logger.info("Saved updated lookup file: %s", output_file)
         return output_file
@@ -1017,7 +946,7 @@ class InfobaseMARCProcessor:
         if len(electronic_videos) == 1:
             logger.debug("Selected electronic video match for %s", lookup_id)
             return str(electronic_videos.iloc[0]['oclcNumber']).strip()
-        elif len(electronic_videos) > 1:
+        if len(electronic_videos) > 1:
             # Multiple electronic videos - take the first one (they're likely duplicates)
             logger.debug("Multiple electronic videos for %s, taking first", lookup_id)
             return str(electronic_videos.iloc[0]['oclcNumber']).strip()
