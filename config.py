@@ -1,4 +1,6 @@
 # config.py
+"""Configuration management for local environment"""
+
 import os
 import json
 import logging
