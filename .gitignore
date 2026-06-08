@@ -43,6 +43,7 @@ kbart_classification_diagnostic.py
 collection_diagnostic.py
 *checker.py
 marc_debug_856z.py
+CLAUDE.md
 
 # Directories
 kbart_files/
