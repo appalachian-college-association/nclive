@@ -21,8 +21,8 @@ class OCLCAuth:
     def __init__(self):
         """Initialize authentication handler with retry strategy"""
         self.config = Config()
-        self.key = self.config.OCLC_KEY
-        self.secret = self.config.OCLC_SECRET
+        self.key = self.config.oclc_key
+        self.secret = self.config.oclc_secret
 
         if not self.key or not self.secret:
             raise ValueError("OCLC credentials not found")

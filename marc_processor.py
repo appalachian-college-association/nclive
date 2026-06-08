@@ -29,22 +29,13 @@ except ImportError:
     print("Please install pymarc: pip install pymarc")
     exit(1)
 
+# Local imports
+from config import OCLC_DTYPES
+
 # Setup logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-_OCLC_DTYPES = {
-    'marcOCN': 'str',
-    'originalNCLiveOCN': 'str',
-    'verifiedOCN': 'str',
-    'oclcNumber': 'str',
-    'lookupID': 'str',
-    'lookupIDcollection': 'str',
-    'source': 'str',
-    'title': 'str',
-    'collection_type': 'str'
-}
 
 class InfobaseMARCProcessor:
     """
@@ -143,7 +134,7 @@ class InfobaseMARCProcessor:
             logger.warning("InfobaseLookup file not found: %s", self.lookup_file)
             return
         try:
-            df = pd.read_csv(self.lookup_file, dtype=_OCLC_DTYPES, keep_default_na=False)
+            df = pd.read_csv(self.lookup_file, dtype=OCLC_DTYPES, keep_default_na=False)
             logger.info("InfobaseLookup columns found: %s", list(df.columns))
             verified_ocn_col = self._resolve_verified_ocn_col(df)
             lookup_id_col = 'lookupID'
@@ -891,7 +882,7 @@ class InfobaseMARCProcessor:
         new_oclc_data = self._load_oclc_results(oclc_results_file)
         try:
             original_df = pd.read_csv(
-                self.lookup_file, dtype=_OCLC_DTYPES, keep_default_na=False
+                self.lookup_file, dtype=OCLC_DTYPES, keep_default_na=False
             )
             logger.info("Loaded %s original records from %s", len(original_df), self.lookup_file)
         except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:

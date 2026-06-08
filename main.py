@@ -1,4 +1,6 @@
-# main-simplified.py
+# main.py
+"""Searches OCLC Discovery API"""
+
 import csv
 import os
 from dotenv import load_dotenv
@@ -19,15 +21,15 @@ logger = logging.getLogger(__name__)
 load_dotenv()  # This loads variables from .env file
 config = Config()
 auth_handler = OCLCAuth()
-API_URL = f"{config.OCLC_BASE_URL}/search/brief-bibs"
-DEFAULT_LIBRARY = config.DEFAULT_LIBRARY # Update .env if not ACACL
-RESTRICT_TO_LIBRARY = config.RESTRICT_TO_LIBRARY # Update .env if not false
-oclc_dtypes = config.OCLC_DTYPES
+API_URL = f"{config.oclc_base_url}/search/brief-bibs"
+DEFAULT_LIBRARY = config.default_library # Update .env if not ACACL
+RESTRICT_TO_LIBRARY = config.restrict_to_library # Update .env if not false
 
 # -------------------------------
 # 2. Load search terms from TSV file
 # -------------------------------
 def load_search_terms(filename):
+    """Load search_terms.tsv"""
     terms = []
     try:
         with open(filename, "r", encoding="utf-8") as file:

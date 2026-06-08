@@ -32,16 +32,16 @@ load_dotenv()
 
 # Load configuration and set up authentication (matching main.py approach)
 try:
-    from config import Config
+    from config import Config, OCLC_DTYPES
     from auth import OCLCAuth
-    
+
     config = Config()
     auth_handler = OCLCAuth()
-    API_URL = f"{config.OCLC_BASE_URL}/search/brief-bibs"
-    DEFAULT_LIBRARY = config.DEFAULT_LIBRARY
-    RESTRICT_TO_LIBRARY = config.RESTRICT_TO_LIBRARY # Default is false (all libraries)
-    oclc_dtypes = config.OCLC_DTYPES
-    
+    API_URL = f"{config.oclc_base_url}/search/brief-bibs"
+    DEFAULT_LIBRARY = config.default_library
+    RESTRICT_TO_LIBRARY = config.restrict_to_library # Default is false (all libraries)
+    oclc_dtypes = OCLC_DTYPES
+
 except ImportError:
     print("Warning: Could not import auth.py and config.py. Please ensure they exist.")
     API_URL = "https://discovery.api.oclc.org/worldcat-org-ci/search/brief-bibs"

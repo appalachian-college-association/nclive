@@ -8,52 +8,52 @@ from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
+OCLC_DTYPES = {
+    'marcOCN': 'str',
+    'originalNCLiveOCN': 'str',
+    'verifiedOCN': 'str',
+    'oclcNumber': 'str',
+    'lookupID': 'str',
+    'lookupIDcollection': 'str',
+    'source': 'str',
+    'title': 'str',
+    'collection_type': 'str'
+}
+
 class Config:
     """Configuration management for local environment"""
-    
+
     def __init__(self):
         # Initialize configuration
-        self._oclc_base_url = os.getenv('OCLC_BASE_URL', 'https://discovery.api.oclc.org/worldcat-org-ci')
+        self._oclc_base_url = os.getenv(
+            'OCLC_BASE_URL', 'https://discovery.api.oclc.org/worldcat-org-ci'
+        )
         self._default_library = os.getenv('DEFAULT_LIBRARY', 'ACACL')
         self._restrict_to_library = os.getenv('RESTRICT_TO_LIBRARY', 'false').lower() == 'true'
         self._url_replace_chars = self._load_json_config(
             'URL_REPLACE_CHARS',
             default=['-', '–', '—', '―']
         )
-        self.OCLC_DTYPES = {
-            'marcOCN': 'str',
-            'originalNCLiveOCN': 'str',
-            'verifiedOCN': 'str',
-            'oclcNumber': 'str',
-            'lookupID': 'str',
-            'lookupIDcollection': 'str',
-            'source': 'str',
-            'title': 'str',
-            'collection_type': 'str'
-        }
-        self.MAX_RESULTS_PER_PAGE = int(os.getenv('MAX_RESULTS_PER_PAGE', '50'))
-        self.DEFAULT_RESULTS_PER_PAGE = int(os.getenv('DEFAULT_RESULTS_PER_PAGE', '10'))
-        
         # Load secrets
         self._load_local_secrets()
-        
+
     def _load_local_secrets(self):
         """Load secrets from local environment"""
-        self.OCLC_KEY = os.getenv('OCLC_KEY')
-        self.OCLC_SECRET = os.getenv('OCLC_SECRET')
-        self.WORLDCAT_KB_KEY = os.getenv('WORLDCAT_KB_KEY')
+        self.oclc_key = os.getenv('OCLC_KEY')
+        self.oclc_secret = os.getenv('OCLC_SECRET')
+        self.worldcat_kb_key = os.getenv('WORLDCAT_KB_KEY')
 
         missing = []
-        if not self.OCLC_KEY:
+        if not self.oclc_key:
             missing.append('OCLC_KEY')
-        if not self.OCLC_SECRET:
+        if not self.oclc_secret:
             missing.append('OCLC_SECRET')
-        if not self.WORLDCAT_KB_KEY:
+        if not self.worldcat_kb_key:
             missing.append('WORLDCAT_KB_KEY')
 
         if missing:
             raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
-        
+
         logger.info("Local secrets loaded successfully")
 
     def _load_json_config(self, env_var: str, default: Dict = None) -> Dict:
@@ -71,23 +71,27 @@ class Config:
             if not value:
                 return default if default is not None else {}
             return json.loads(value)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid JSON in {env_var}, using default")
+        except json.JSONDecodeError:
+            logger.warning("Invalid JSON in %s, using default", {env_var})
             return default if default is not None else {}
 
     # Properties
     @property
-    def URL_REPLACE_CHARS(self) -> List[str]:
+    def url_replace_chars(self) -> List[str]:
+        """Characters to strip from URLs before processing."""
         return self._url_replace_chars
-      
+
     @property
-    def DEFAULT_LIBRARY(self) -> str:
+    def default_library(self) -> str:
+        """Default OCLC library symbol for API queries."""
         return self._default_library
-        
-    @property 
-    def OCLC_BASE_URL(self) -> str:
-        return self._oclc_base_url
-    
+
     @property
-    def RESTRICT_TO_LIBRARY(self) -> bool:
+    def oclc_base_url(self) -> str:
+        """Base URL for the OCLC Discovery API."""
+        return self._oclc_base_url
+
+    @property
+    def restrict_to_library(self) -> bool:
+        """True limits API search to default library holdings; False for global search"""
         return self._restrict_to_library
