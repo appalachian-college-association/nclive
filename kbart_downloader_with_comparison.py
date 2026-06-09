@@ -7,11 +7,12 @@ KBART downloader that:
 4. Provides detailed statistics and reports
 """
 
-import requests
 import os
-from dotenv import load_dotenv
 from datetime import datetime
 import pathlib
+import shutil
+import requests
+from dotenv import load_dotenv
 
 
 # Paths to OCLC KB API endpoints
@@ -27,7 +28,6 @@ def load_config():
         raise ValueError("WORLDCAT_KB_KEY not found in environment variables")
 
     return api_key
-
 
 def get_collection_details(api_key, collection_uid):
     """Get detailed information about a specific collection including KBART link"""
@@ -71,10 +71,9 @@ def get_collection_details(api_key, collection_uid):
                 'kbart_url': kbart_url
             }
 
-        else:
-            print(f"Error accessing collection details: {response.status_code}")
-            print(f"Response: {response.text[:200]}")
-            return None
+        print(f"Error accessing collection details: {response.status_code}")
+        print(f"Response: {response.text[:200]}")
+        return None
 
     except requests.exceptions.Timeout:
         print(f"Request timed out for {collection_uid}")
@@ -85,7 +84,6 @@ def get_collection_details(api_key, collection_uid):
     except requests.exceptions.RequestException as e:
         print(f"Error making request: {e}")
         return None
-
 
 def download_kbart_file(
         api_key, kbart_url, collection_uid, metadata_count, output_dir="kbart_files"
@@ -156,7 +154,6 @@ def download_kbart_file(
         print(f"Error making request: {e}")
         return None
 
-
 def _find_column_indices(headers):
     indices = {
         k: None for k in (
@@ -176,7 +173,6 @@ def _find_column_indices(headers):
         elif h == 'publication_title':
             indices['publication_title'] = i
     return indices
-
 
 def parse_kbart_file(filepath):
     """Parse KBART file and extract key fields for comparison"""
@@ -256,7 +252,6 @@ def parse_kbart_file(filepath):
         print(f"Error parsing KBART file: {e}")
         return []
 
-
 def validate_kbart_freshness(metadata_count, kbart_filepath, collection_name):
     """
     Validate that downloaded KBART matches collection metadata to detect stale cache.
@@ -318,10 +313,9 @@ RECOMMENDED ACTIONS:
 """
             return False, kbart_count, message
 
-        else:
-            # Fresh data validated
-            message = f"✅ KBART validated - file current ({kbart_count:,} records match metadata)"
-            return True, kbart_count, message
+        # Fresh data validated
+        message = f"✅ KBART validated - file current ({kbart_count:,} records match metadata)"
+        return True, kbart_count, message
 
     except (OSError, ValueError) as e:
         error_message = f"❌ Error validating KBART file: {e}"
@@ -338,21 +332,12 @@ def compare_collections(bcla_data, nclive_data, collection_type):
     bcla_lookup = {record['full_title_id']: record for record in bcla_data}
     nclive_lookup = {record['full_title_id']: record for record in nclive_data}
 
-    bcla_ids = set(bcla_lookup.keys())
-    nclive_ids = set(nclive_lookup.keys())
+    print(f"BCLA {collection_type}: {len(bcla_lookup)} titles")
+    print(f"NC Live {collection_type}: {len(nclive_lookup)} titles")
 
-    print(f"BCLA {collection_type}: {len(bcla_ids)} titles")
-    print(f"NC Live {collection_type}: {len(nclive_ids)} titles")
-
-    # Find matches and mismatches
-    common_ids = bcla_ids & nclive_ids
-    bcla_only = bcla_ids - nclive_ids
-    nclive_only = nclive_ids - bcla_ids
-
-    # Find matches and mismatches by FULL title_id
-    common_ids = bcla_ids & nclive_ids
-    bcla_only = bcla_ids - nclive_ids
-    nclive_only = nclive_ids - bcla_ids
+    common_ids = bcla_lookup.keys() & nclive_lookup.keys()
+    bcla_only = bcla_lookup.keys() - nclive_lookup.keys()
+    nclive_only = nclive_lookup.keys() - bcla_lookup.keys()
 
     print(f"Common titles (exact match): {len(common_ids)}")
     print(f"BCLA only: {len(bcla_only)}")
@@ -368,16 +353,11 @@ def compare_collections(bcla_data, nclive_data, collection_type):
         mismatches = {}
 
         # Compare key fields
-        fields_to_compare = ['title_url', 'oclc_number', 'oclc_entry_id']
-
-        for field in fields_to_compare:
-            bcla_value = bcla_record.get(field, '').strip()
-            nclive_value = nclive_record.get(field, '').strip()
-
-            if bcla_value != nclive_value:
+        for field in ['title_url', 'oclc_number', 'oclc_entry_id']:
+            if bcla_record.get(field, '').strip() != nclive_record.get(field, '').strip():
                 mismatches[field] = {
-                    'bcla': bcla_value,
-                    'nclive': nclive_value
+                    'bcla': bcla_record.get(field, '').strip(),
+                    'nclive': nclive_record.get(field, '').strip()
                 }
 
         if mismatches:
@@ -391,8 +371,8 @@ def compare_collections(bcla_data, nclive_data, collection_type):
 
     return {
         'collection_type': collection_type,
-        'bcla_count': len(bcla_ids),
-        'nclive_count': len(nclive_ids),
+        'bcla_count': len(bcla_lookup),
+        'nclive_count': len(nclive_lookup),
         'common_count': len(common_ids),
         'bcla_only_count': len(bcla_only),
         'nclive_only_count': len(nclive_only),
@@ -514,7 +494,6 @@ def organize_kbart_files_for_pipeline():
         working_path = kbart_dir / working_name
 
         if original_path.exists():
-            import shutil
             shutil.copy2(original_path, working_path)
             print(f"Created working copy: {working_name}")
 
@@ -530,6 +509,103 @@ def organize_kbart_files_for_pipeline():
     print("Files organized for pipeline use!")
     print("marc_processor_v4.py will now use only fod_kbart.txt and jfk_kbart.txt")
 
+def _download_collections(api_key, target_collections):
+    """Download all KBART files; return (downloaded_files, validation_failures)."""
+    downloaded_files = {}
+    validation_failures = []
+
+    print("DOWNLOADING KBART FILES")
+    print("=" * 40)
+
+    for collection_name, collection_uid in target_collections.items():
+        print(f"Processing {collection_name} ({collection_uid})")
+        details = get_collection_details(api_key, collection_uid)
+        if details and details['kbart_url']:
+            metadata_count = int(details.get('available_entries', 0))
+            filepath, is_valid = download_kbart_file(
+                api_key,
+                details['kbart_url'],
+                collection_uid,
+                metadata_count
+            )
+            if filepath:
+                downloaded_files[collection_name] = {
+                    'filepath': filepath,
+                    'details': details,
+                    'is_valid': is_valid
+                }
+                if is_valid:
+                    print(f"✅ {collection_name} downloaded and validated successfully")
+                else:
+                    print(f"{collection_name} downloaded but VALIDATION FAILED")
+                    validation_failures.append(collection_name)
+            else:
+                print(f"Failed to download {collection_name}")
+        else:
+            print(f"Could not get details for {collection_name}")
+
+    return downloaded_files, validation_failures
+
+
+def _check_validation(validation_failures):
+    """Warn user about stale data and ask whether to continue. Returns True to proceed."""
+    if not validation_failures:
+        return True
+
+    print(f"\n{'='*70}")
+    print("⚠️  VALIDATION FAILURES DETECTED")
+    print(f"{'='*70}")
+    print("\nThe following collections have stale KBART data:")
+    for collection in validation_failures:
+        print(f"  • {collection}")
+    print("\nRECOMMENDED ACTIONS:")
+    print("1. Wait 24 hours and re-run this script")
+    print("2. Use manual downloads with organize_manual_kbart.py")
+    print("3. Review validation messages above for details")
+    print(f"\n{'='*70}")
+    user_input = input("Continue with stale data? (yes/no): ").strip().lower()
+    if user_input not in ['yes', 'y']:
+        print("\n⏸️  Processing stopped by user")
+        print("Re-run this script after 24 hours or use manual downloads")
+        return False
+    print("\n⚠️  WARNING: Continuing with potentially stale data")
+    return True
+
+
+def _run_comparison(downloaded_files):
+    """Parse downloaded KBART files, compare FOD and JFK collections, and save report."""
+    if len(downloaded_files) != 4:
+        print(f"Could not download all KBART files. Downloaded: {len(downloaded_files)}/4")
+        return
+
+    print(f"\n{'='*70}")
+    print("PERFORMING COLLECTION COMPARISONS")
+    print(f"{'='*70}")
+
+    kbart_data = {
+        name: parse_kbart_file(info['filepath'])
+        for name, info in downloaded_files.items()
+    }
+
+    fod_comparison = compare_collections(
+        kbart_data['bcla_fod'], kbart_data['nclive_fod'], 'FOD'
+    )
+    jfk_comparison = compare_collections(
+        kbart_data['bcla_jfk'], kbart_data['nclive_jfk'], 'JFK'
+    )
+
+    save_comparison_report(fod_comparison, jfk_comparison)
+
+    print("COMPARISON SUMMARY")
+    print("=" * 30)
+    print("FOD Collections:")
+    print(f"  Exact matches: {fod_comparison['common_count']}")
+    print(f"  Field mismatches: {fod_comparison['field_mismatches_count']}")
+    print("JFK Collections:")
+    print(f"  Exact matches: {jfk_comparison['common_count']}")
+    print(f"  Field mismatches: {jfk_comparison['field_mismatches_count']}")
+
+
 def main():
     """Main function to download KBART files and perform comparisons"""
 
@@ -540,7 +616,6 @@ def main():
         api_key = load_config()
         print("API key loaded")
 
-        # Define target collections
         target_collections = {
             'bcla_fod': 'customer.5210.ncfod',
             'bcla_jfk': 'customer.5210.20',
@@ -548,113 +623,14 @@ def main():
             'nclive_jfk': 'customer.54122.9'
         }
 
-        downloaded_files = {}
-        validation_failures = []  # Track collections with stale data
+        downloaded_files, validation_failures = _download_collections(
+            api_key, target_collections
+        )
 
-        # Download all KBART files
-        print("DOWNLOADING KBART FILES")
-        print("=" * 40)
+        if not _check_validation(validation_failures):
+            return
 
-        for collection_name, collection_uid in target_collections.items():
-            print(f"Processing {collection_name} ({collection_uid})")
-
-            details = get_collection_details(api_key, collection_uid)
-
-            if details and details['kbart_url']:
-                # Get metadata count for validation
-                metadata_count = int(details.get('available_entries', 0))
-
-                # Download with validation
-                filepath, is_valid = download_kbart_file(
-                    api_key,
-                    details['kbart_url'],
-                    collection_uid,
-                    metadata_count  # Pass metadata count for validation
-                )
-
-                if filepath:
-                    downloaded_files[collection_name] = {
-                        'filepath': filepath,
-                        'details': details,
-                        'is_valid': is_valid
-                    }
-
-                    if is_valid:
-                        print(f"✅ {collection_name} downloaded and validated successfully")
-                    else:
-                        print(f"{collection_name} downloaded but VALIDATION FAILED")
-                        validation_failures.append(collection_name)
-                else:
-                    print(f"Failed to download {collection_name}")
-            else:
-                print(f"Could not get details for {collection_name}")
-
-        # *** NEW: CHECK FOR VALIDATION FAILURES BEFORE PROCEEDING ***
-        if validation_failures:
-            print(f"\n{'='*70}")
-            print("⚠️  VALIDATION FAILURES DETECTED")
-            print(f"{'='*70}")
-            print("\nThe following collections have stale KBART data:")
-            for collection in validation_failures:
-                print(f"  • {collection}")
-
-            print("\nRECOMMENDED ACTIONS:")
-            print("1. Wait 24 hours and re-run this script")
-            print("2. Use manual downloads with organize_manual_kbart.py")
-            print("3. Review validation messages above for details")
-
-            # Ask user if they want to continue anyway
-            print(f"\n{'='*70}")
-            user_input = input("Continue with stale data? (yes/no): ").strip().lower()
-
-            if user_input not in ['yes', 'y']:
-                print("\n⏸️  Processing stopped by user")
-                print("Re-run this script after 24 hours or use manual downloads")
-                return
-            print("\n⚠️  WARNING: Continuing with potentially stale data")
-
-        # Continue with comparison and organization if user chose to proceed
-        # OR if all validations passed
-
-        if len(downloaded_files) == 4:
-            print(f"\n{'='*70}")
-            print("PERFORMING COLLECTION COMPARISONS")
-            print(f"{'='*70}")
-
-            # Parse KBART files
-            kbart_data = {}
-            for collection_name, file_info in downloaded_files.items():
-                kbart_data[collection_name] = parse_kbart_file(file_info['filepath'])
-
-            # Compare FOD collections
-            fod_comparison = compare_collections(
-                kbart_data['bcla_fod'],
-                kbart_data['nclive_fod'],
-                'FOD'
-            )
-
-            # Compare JFK collections
-            jfk_comparison = compare_collections(
-                kbart_data['bcla_jfk'],
-                kbart_data['nclive_jfk'],
-                'JFK'
-            )
-
-            # Save detailed report
-            save_comparison_report(fod_comparison, jfk_comparison)
-
-            # Print summary
-            print("COMPARISON SUMMARY")
-            print("=" * 30)
-            print("FOD Collections:")
-            print(f"  Exact matches: {fod_comparison['common_count']}")
-            print(f"  Field mismatches: {fod_comparison['field_mismatches_count']}")
-            print("JFK Collections:")
-            print(f"  Exact matches: {jfk_comparison['common_count']}")
-            print(f"  Field mismatches: {jfk_comparison['field_mismatches_count']}")
-
-        else:
-            print(f"Could not download all KBART files. Downloaded: {len(downloaded_files)}/4")
+        _run_comparison(downloaded_files)
 
         print("\nFILES IN kbart_files DIRECTORY:")
         kbart_dir = pathlib.Path("kbart_files")
@@ -663,8 +639,6 @@ def main():
                 print(f"  {file.name}")
 
         print("Process complete!")
-
-        # Organize files for pipeline use
         organize_kbart_files_for_pipeline()
 
     except (OSError, requests.exceptions.RequestException, KeyError, ValueError) as e:
