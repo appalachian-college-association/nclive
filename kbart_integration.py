@@ -122,10 +122,25 @@ class KBARTFinalIntegrator:
             oclc_num = str(row.get(oclc_num_col, '')).strip()
             if not title_id_encoded or not entry_id:
                 continue
-            decoded_title_id = (
-                title_id_encoded.replace('%3D', '=').replace('%2D', '-').lower()
-            )
-            lookup_id_collection = f"{decoded_title_id}${collection_suffix}"
+            # Detect AVOD records by the presence of a slash in title_id
+            # (e.g. "video/7384?aid=") vs old-platform percent-encoded format
+            # (e.g. "xtid%3D12345")
+            # AVOD path IDs and legacy xtid values are different ID spaces and
+            # must not share a key namespace — a slash prefix makes them distinct.
+            if '/' in title_id_encoded:
+                # AVOD: strip the ?aid= placeholder to recover the avod_title_id value
+                # "video/7384?aid=" -> avod_title_id "video/7384"
+                # Key uses "avod:" prefix to avoid any collision with xtid= keys
+                avod_base = title_id_encoded.split('?', maxsplit=1)[0]
+                lookup_id_collection = f"avod:{avod_base}${collection_suffix}"
+            else:
+                # Old platform: decode percent-encoding to reconstruct key
+                # "xtid%3D12345" -> "xtid=12345$fod"
+                decoded_title_id = (
+                    title_id_encoded.replace('%3D', '=').replace('%2D', '-').lower()
+                )
+                lookup_id_collection = f"{decoded_title_id}${collection_suffix}"
+
             self.existing_entry_ids[lookup_id_collection] = {
                 'entry_id': entry_id,
                 'oclc_number': oclc_num,
@@ -205,56 +220,79 @@ class KBARTFinalIntegrator:
     def create_kbart_record(self, row, collection_id, collection_info, existing_ids_in_file):
         """
         Create a single KBART record with proper formatting.
-        FIXED: Uses lookupIDcollection for entry_id management.
+        ADDED avod_title_id.
         """
 
-        # FIXED: Get lookupIDcollection directly from the row
-        lookup_id_collection = row.get('lookupIDcollection', '')
-        lookup_id = row.get('lookupID', '')
-
-        if not lookup_id_collection or not lookup_id:
+        # Remove old platform when JFK migrates to AVOD to clear Pylint message (local variables).
+        if not row.get('lookupIDcollection', '') or not row.get('lookupID', ''):
             logger.warning("Missing lookupID or lookupIDcollection: %s", row)
             return None
 
-        # Extract title_id from lookupID for URL and encoding
-        title_match = re.search(r'(xtid|customid)=(.+)\$', lookup_id)
-        if not title_match:
-            logger.warning("Could not parse title_id from lookupID: %s", lookup_id)
-            return None
+        # Check for AVOD (Access Video on Demand) records - new FOD platform
+        avod_title_id = row.get('avod_title_id', '')
 
-        prefix = title_match.group(1)
-        numeric_id = title_match.group(2)
-        url_prefix = "customID" if prefix.lower() == "customid" else prefix
+        if avod_title_id:
+            # New platform: title_id and title_url come from avod_title_id column
+            # avod_title_id is stored as e.g. "video/7384"
+            # title_id uses clean unencoded format with ?aid= placeholder
+            # title_url uses full base URL with same ?aid= placeholder
+            title_id_encoded = f"{avod_title_id}?aid="
+            title_url = f"https://access.infobase.com/{avod_title_id}?aid="
+        else:
+            # Old platform: extract title_id from lookupID using xtid= or customid= pattern
+            title_match = re.search(r'(xtid|customid)=(.+)\$', row.get('lookupID', ''))
+            if not title_match:
+                logger.warning(
+                    "Could not parse title_id from lookupID: %s", row.get('lookupID', '')
+                )
+                return None
 
-        # Create encoded title_id for KBART
-        title_id_encoded = f"{prefix}%3D{numeric_id}"
+            prefix = title_match.group(1)
+            numeric_id = title_match.group(2)
+            url_prefix = "customID" if prefix.lower() == "customid" else prefix
 
-        # Create title_url
-        if collection_info['type'] == 'fod':
-            title_url = f"https://fod.infobase.com/portalplaylists.aspx?{url_prefix}={numeric_id}"
-        else:  # jfk
-            title_url = f"https://jfk.infobase.com/portalplaylists.aspx?{url_prefix}={numeric_id}"
+            # Create encoded title_id for KBART (percent-encodes the = sign)
+            title_id_encoded = f"{prefix}%3D{numeric_id}"
+
+            # REMOVE LOOP AFTER JFK MIGRATES TO AVOD PLATFORM
+            # Create title_url based on collection type
+            if collection_info['type'] == 'jfk':
+                title_url = (
+                    f"https://jfk.infobase.com/PortalPlaylists.aspx?{url_prefix}={numeric_id}"
+                )
+            else:  # fod without avod_title_id
+                logger.warning("Missing URL parameter for: %s", row.get('lookupID', ''))
+                return None
 
         # Get OCLC number
         oclc_number = row.get('verifiedOCN', '')
 
-        # FIXED: Determine oclc_entry_id using lookupIDcollection
-        if lookup_id_collection in self.existing_entry_ids:
-            # Use existing entry_id
-            entry_id = self.existing_entry_ids[lookup_id_collection]['entry_id']
-            existing_ids_in_file.add(entry_id)  # Register so new entries don't duplicate it
+        # Build the lookup key for existing entry_id preservation.
+        # AVOD records use a distinct "avod:" prefix to avoid collision with
+        # old-platform xtid keys — AVOD path IDs and xtid values are different
+        # ID spaces and the same number can refer to different titles.
+        lookup_id_collection = row.get('lookupIDcollection', '')
+        if avod_title_id:
+            entry_lookup_key = f"avod:{avod_title_id}${collection_info['type']}"
+        else:
+            entry_lookup_key = lookup_id_collection
+
+        if entry_lookup_key in self.existing_entry_ids:
+            entry_id = self.existing_entry_ids[entry_lookup_key]['entry_id']
+            existing_ids_in_file.add(entry_id)
             self.stats['preserved_entry_ids'] += 1
             logger.debug(
                 "Preserved entry_id %s for %s", entry_id, lookup_id_collection
             )
         else:
-            # Generate new unique entry_id
             entry_id = self.generate_unique_entry_id(
                 lookup_id_collection, oclc_number, existing_ids_in_file
             )
             existing_ids_in_file.add(entry_id)
             self.stats['new_entry_ids'] += 1
-            logger.debug("Generated new entry_id %s for %s", entry_id, lookup_id_collection)
+            logger.debug(
+                "Generated new entry_id %s for %s", entry_id, lookup_id_collection
+            )
 
         return {
             'publication_title': self.clean_text_for_kbart(row.get('title', '')),
