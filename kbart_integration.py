@@ -49,7 +49,8 @@ class KBARTFinalIntegrator:
         }
 
         # Store existing entry_ids to preserve them
-        # FIXED: Using lookupIDcollection as key instead of decoded title_id
+        # Using lookupIDcollection as key for old-platform records;
+        # "avod:{avod_title_id}${collection}" for AVOD records.
         self.existing_entry_ids = {}
 
         # Track statistics
