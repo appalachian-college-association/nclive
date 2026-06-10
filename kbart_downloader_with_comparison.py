@@ -12,6 +12,7 @@ from datetime import datetime
 import pathlib
 import shutil
 import requests
+from urllib.parse import unquote
 from dotenv import load_dotenv
 
 
@@ -146,13 +147,13 @@ def download_kbart_file(
 
     except requests.exceptions.Timeout:
         print(f"Request timed out for {collection_uid}")
-        return None  # or (None, False)
+        return None, False
     except requests.exceptions.ConnectionError:
         print(f"Connection error for {collection_uid}")
-        return None
+        return None, False
     except requests.exceptions.RequestException as e:
         print(f"Error making request: {e}")
-        return None
+        return None, False
 
 def _find_column_indices(headers):
     indices = {
@@ -231,15 +232,11 @@ def parse_kbart_file(filepath):
             record['line_number'] = line_num
 
             # Extract FULL title_id (including prefix) for matching
+            # unquote() normalizes percent-encoded old-format IDs like
+            # "xtid%3D123456" -> "xtid=123456" while leaving AVOD
+            # title_ids like "video/7384?aid=" unchanged.
             title_id_raw = record['title_id']
-            if title_id_raw:
-                # Handle URL-encoded format like "xtid%3D123456" -> "xtid=123456"
-                if '%3D' in title_id_raw:
-                    record['full_title_id'] = title_id_raw.replace('%3D', '=')
-                else:
-                    record['full_title_id'] = title_id_raw
-            else:
-                record['full_title_id'] = ''
+            record['full_title_id'] = unquote(title_id_raw) if title_id_raw else ''
 
             # Only include records with valid title_id
             if record['full_title_id']:
@@ -507,7 +504,7 @@ def organize_kbart_files_for_pipeline():
         print(f"      {moved_file}")
 
     print("Files organized for pipeline use!")
-    print("marc_processor_v4.py will now use only fod_kbart.txt and jfk_kbart.txt")
+    print("marc_processor.py will now use only fod_kbart.txt and jfk_kbart.txt")
 
 def _download_collections(api_key, target_collections):
     """Download all KBART files; return (downloaded_files, validation_failures)."""
