@@ -15,19 +15,20 @@ This replaces the manual workflow of:
 # pylint: disable=too-many-lines
 
 import csv
-import pandas as pd
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import logging
 from datetime import datetime
+import pandas as pd
 
 # MARC processing library
 try:
     from pymarc import MARCReader, Record, PymarcException
 except ImportError:
     print("Please install pymarc: pip install pymarc")
-    exit(1)
+    sys.exit(1)
 
 # Local imports
 from config import OCLC_DTYPES
@@ -1201,13 +1202,10 @@ def update_lookup_main():
     print("3. Run: python kbart_entry_validator.py (to validate)")
 
 if __name__ == "__main__":
-    import sys
-
     if len(sys.argv) > 1 and sys.argv[1] == "--debug":
         debug_main()
     elif len(sys.argv) > 1 and sys.argv[1] == "--update-lookup":
         update_lookup_main()
-
     else:
         # First phase: process MARC and generate search terms
         main()
