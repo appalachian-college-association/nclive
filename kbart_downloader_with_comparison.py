@@ -1,4 +1,4 @@
-# kbart_downloader_with_comparison.py V2 add validation to check for stale KBART
+# kbart_downloader_with_comparison.py added validation to check for stale KBART
 """
 KBART downloader that:
 1. Downloads KBART files for both BCLA (customer.5210.*) and NC Live (customer.54122.*) collections
@@ -11,8 +11,8 @@ import os
 from datetime import datetime
 import pathlib
 import shutil
-import requests
 from urllib.parse import unquote
+import requests
 from dotenv import load_dotenv
 
 

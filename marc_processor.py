@@ -185,19 +185,34 @@ class InfobaseMARCProcessor:
                         continue
                     title_id_decoded = self._decode_url_encoding(title_id_encoded)
                     if title_id_decoded.startswith(('xtid=', 'customid=')):
+                        # Legacy FOD and JFK records: key by numeric ID
                         lookup_id_format = f"{title_id_decoded}$"
                         numeric_id = title_id_decoded.split('=', maxsplit=1)[-1]
-                    else:
-                        lookup_id_format = f"customid={title_id_decoded}$"
-                        numeric_id = title_id_decoded
-                    if lookup_id_format not in self.infobase_lookup:
-                        self.kbart_lookup[numeric_id] = {
+                        if lookup_id_format not in self.infobase_lookup:
+                            self.kbart_lookup[numeric_id] = {
+                                'oclc_number': oclc_num,
+                                'encoded_title_id': title_id_encoded,
+                                'decoded_title_id': title_id_decoded
+                            }
+                            count += 1
+                    elif re.match(r'^[a-z]+/\d+', title_id_decoded):
+                        # AVOD records (e.g., 'video/7384?aid='): store under avod: prefix
+                        # to prevent namespace collision with legacy xtid integers
+                        avod_key = f"avod:{title_id_decoded}"
+                        self.kbart_lookup[avod_key] = {
                             'oclc_number': oclc_num,
                             'encoded_title_id': title_id_encoded,
                             'decoded_title_id': title_id_decoded
                         }
                         count += 1
-            logger.info("SECONDARY: Loaded %s entries from %s", len(df), kbart_file.name)
+                    else:
+                        # Unknown format: log a warning and skip rather than
+                        # misclassifying as customid
+                        logger.warning(
+                            "Skipping unrecognized KBART title_id format: %s",
+                            title_id_decoded
+                        )
+            logger.info("SECONDARY: Loaded %s entries from %s", count, kbart_file.name)
             return count
         except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError) as e:
             logger.warning("Could not load KBART file %s: %s", kbart_file, e)
@@ -557,11 +572,16 @@ class InfobaseMARCProcessor:
         lookup_id = record['lookup_id']
         marc_035_ocn = record['marc_035_ocn']
 
-        # Extract numeric title ID for KBART lookup
+        # Extract lookup keys for KBART secondary lookup.
+        # Legacy records use a numeric ID; AVOD records use the avod: prefix
+        # to prevent namespace collision with legacy xtid integers.
         title_id_numeric = None
+        avod_key = None
         id_match = re.search(r'(?:xtid|customid)=(.+)\$', lookup_id)
         if id_match:
             title_id_numeric = id_match.group(1)
+        elif record.get('avod_title_id'):
+            avod_key = f"avod:{record['avod_title_id']}"
 
         # HIERARCHICAL LOOKUP:
 
@@ -577,6 +597,15 @@ class InfobaseMARCProcessor:
         # 2. SECONDARY: Check KBART files (current collection data)
         if title_id_numeric and title_id_numeric in self.kbart_lookup:
             kbart_data = self.kbart_lookup[title_id_numeric]
+            if isinstance(kbart_data, dict):
+                oclc_num = kbart_data['oclc_number']
+            else:
+                oclc_num = kbart_data  # Fallback for old format
+            self.stats['matched_kbart'] += 1
+            return oclc_num, "KBART"
+
+        if avod_key and avod_key in self.kbart_lookup:
+            kbart_data = self.kbart_lookup[avod_key]
             if isinstance(kbart_data, dict):
                 oclc_num = kbart_data['oclc_number']
             else:
@@ -1045,7 +1074,7 @@ class InfobaseMARCProcessor:
                 print("  MISSING MARC 028$a - using URL fallback")
 
             # Extract title ID for NC Live pattern analysis
-            id_match = re.search(r'(?:xtid|customid)=(.+)\$', record['lookupID'])
+            id_match = re.search(r'(?:xtid|customid)=(.+)\$', record['lookup_id'])
             if id_match:
                 title_id_numeric = id_match.group(1)
                 nc_live_pattern = f"1000{title_id_numeric}"
