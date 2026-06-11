@@ -184,10 +184,11 @@ class InfobaseMARCProcessor:
                             oclc_num.lower() not in ('', 'nan', 'null')):
                         continue
                     title_id_decoded = self._decode_url_encoding(title_id_encoded)
-                    if title_id_decoded.startswith(('xtid=', 'customid=')):
+                    title_id_normalized = title_id_decoded.lower()
+                    if title_id_normalized.startswith(('xtid=', 'customid=')):
                         # Legacy FOD and JFK records: key by numeric ID
-                        lookup_id_format = f"{title_id_decoded}$"
-                        numeric_id = title_id_decoded.split('=', maxsplit=1)[-1]
+                        lookup_id_format = f"{title_id_normalized}$"
+                        numeric_id = title_id_normalized.split('=', maxsplit=1)[-1]
                         if lookup_id_format not in self.infobase_lookup:
                             self.kbart_lookup[numeric_id] = {
                                 'oclc_number': oclc_num,

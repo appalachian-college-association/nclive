@@ -1,5 +1,5 @@
 # main.py
-"""Searches OCLC Discovery API"""
+"""Searches OCLC Discovery API using search_terms.tsv"""
 
 import csv
 import os
