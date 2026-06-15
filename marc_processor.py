@@ -682,7 +682,7 @@ class InfobaseMARCProcessor:
                 if xtid_match:
                     # This is an xtid - safe to search in API
                     search_id = xtid_match.group(1)
-                    search_term = f"sn:{search_id}"  # Publisher number search
+                    search_term = f"mn:{search_id}"  # Publisher number search
                     search_terms.append((lookup_id_collection, search_term))
                     logger.debug("Added xtid for API search: %s", lookup_id_collection)
                 else:
