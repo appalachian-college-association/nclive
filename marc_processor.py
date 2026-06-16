@@ -297,11 +297,15 @@ class InfobaseMARCProcessor:
 
     def _extract_record_fields(self, record: Record) -> Optional[Dict]:
         """Extract and process fields from a single MARC record."""
+        # pylint: disable=too-many-locals
         try:
             control_001 = record['001'].data if record['001'] else ""
             field_028_a = self._get_subfield_values(record, '028', 'a')
             field_035_a = self._get_subfield_values(record, '035', 'a')
             field_245_a = self._get_subfield_values(record, '245', 'a')
+            field_245_b = self._get_subfield_values(record, '245', 'b')
+            field_710_corporate = self._extract_corporate_name(record)
+            field_830_a = self._get_subfield_values(record, '830', 'a')
             field_856_u = self._get_subfield_values(record, '856', 'u')
             field_856_z = self._get_subfield_values(record, '856', 'z')
 
@@ -327,11 +331,15 @@ class InfobaseMARCProcessor:
                 'lookup_id_collection': lookup_id_collection,
                 'marc_035_ocn': marc_035_ocn,
                 'title': field_245_a[0] if field_245_a else "",
+                'subtitle': field_245_b[0] if field_245_b else "",
                 'url': field_856_u[0] if field_856_u else "",
                 'collection_type': collection_type,
                 'title_ids_raw': field_028_a,
                 'url_description': field_856_z[0] if field_856_z else "",
-                'avod_title_id': avod_title_id
+                'avod_title_id': avod_title_id,
+                'corporate_name': field_710_corporate,
+                'series_name': field_830_a[0].rstrip('., ') if field_830_a else "",
+                'has_028': bool(field_028_a),
             }
 
         except (AttributeError, KeyError, TypeError, ValueError) as e:
@@ -444,6 +452,61 @@ class InfobaseMARCProcessor:
             path_id = match.group(2)       # e.g., '7384'
             return f"{format_type}/{path_id}"
         return ""
+
+    # NEW helper methods for corporate name (au: search in query)
+    def _extract_corporate_name(self, record: Record) -> str:
+        """
+        Extract the best corporate name from MARC 710$a for use in au: API searches.
+
+        Priority order:
+          1. First 710$a that is not Infobase and not Films for the Humanities & Sciences
+          2. 'Films for the Humanities & Sciences' (if nothing better exists)
+          3. A value starting with 'Infobase' (last resort)
+          4. Empty string if no 710 fields exist at all
+
+        The selected value is cleaned before return:
+          - Trailing punctuation (periods, commas, spaces) is stripped
+          - ' (Firm)' is stripped (case-insensitive)
+          - Any remaining trailing whitespace is stripped
+
+        Returns a clean name string, or '' if no 710 fields exist.
+        """
+        best_firm = ""         # Priority 1: any qualifying corporate name
+        fhs_fallback = ""      # Priority 2: Films for the Humanities & Sciences
+        infobase_fallback = "" # Priority 3: Infobase name
+
+        for field in record.get_fields('710'):
+            subfield_a = field.get_subfields('a')
+            if not subfield_a:
+                continue
+            raw_name = subfield_a[0].strip()
+            cleaned = self._clean_corporate_name(raw_name)
+
+            if cleaned.lower().startswith('infobase'):
+                if not infobase_fallback:
+                    infobase_fallback = cleaned
+            elif 'films for the humanities' in cleaned.lower():
+                if not fhs_fallback:
+                    fhs_fallback = cleaned
+            else:
+                if not best_firm:
+                    best_firm = cleaned
+
+        return best_firm or fhs_fallback or infobase_fallback
+
+    def _clean_corporate_name(self, name: str) -> str:
+        """
+        Clean a MARC 710$a corporate name for use in an OCLC au: search.
+
+        Strips trailing punctuation (periods, commas, spaces), removes the
+        MARC relationship designator ' (Firm)' (case-insensitive), then
+        strips any remaining trailing whitespace.
+        """
+        cleaned = name.rstrip('., ')
+        # Remove ' (Firm)' suffix, case-insensitive
+        if cleaned.lower().endswith(' (firm)'):
+            cleaned = cleaned[:-len(' (firm)')]
+        return cleaned.strip()
 
     def _determine_collection_type_with_fallback(
             self, record: Dict, original_lookup_data: Dict
@@ -661,6 +724,7 @@ class InfobaseMARCProcessor:
         IMPORTANT: Only searches on xtid values, NOT customid values.
         customid values don't correspond to MARC 028 fields and cause bad matches.
         """
+        # pylint: disable=too-many-locals
         logger.info("Generating search terms using hierarchical lookup...")
 
         search_terms = []
@@ -678,23 +742,52 @@ class InfobaseMARCProcessor:
                 # Check if this is an xtid or customid
                 # ONLY search on xtid values - these correspond to MARC 028 fields
                 xtid_match = re.search(r'xtid=(.+)\$', lookup_id)
-
                 if xtid_match:
                     # This is an xtid - safe to search in API
                     search_id = xtid_match.group(1)
-                    search_term = f"mn:{search_id}"  # Publisher number search
-                    search_terms.append((lookup_id_collection, search_term))
+                    search_term = f"mn:{search_id}"  # Publisher number search (MARC 028$a)
+
+                    # Build au: fragment from 710$a corporate name (empty string if absent)
+                    corporate_name = record.get('corporate_name', '')
+                    au_fragment = f' AND au:"{corporate_name}"' if corporate_name else ''
+
+                    # Build se: fragment from 830$a series name (empty string if absent)
+                    series_name = record.get('series_name', '')
+                    se_fragment = f' AND se:"{series_name}"' if series_name else ''
+
+                    # Set review flags
+                    mn_flag = 'N' if record.get('has_028', True) else 'Y'
+                    au_flag = 'Y' if not corporate_name else 'N'
+
+                    search_terms.append((
+                        lookup_id_collection,
+                        search_term,
+                        au_fragment,
+                        se_fragment,
+                        mn_flag,
+                        au_flag,
+                    ))
                     logger.debug("Added xtid for API search: %s", lookup_id_collection)
+
                 else:
                     # Check if this is a customid - these should NOT be searched
                     customid_match = re.search(r'customid=(.+)\$', lookup_id)
                     if customid_match:
-                        # This is a customid - mark for manual review instead
+                        # customid records cannot be searched via mn: - write a
+                        # placeholder row so --update-lookup routes them to MANUAL_REVIEW
                         customid_manual_review.append(lookup_id_collection)
+                        search_terms.append((
+                            lookup_id_collection,
+                            '',   # no search term
+                            '',   # no au: fragment
+                            '',   # no se: fragment
+                            'Y',  # mn-review-flag: mn: search not possible
+                            'Y',  # au-review-flag: no au: anchor either
+                        ))
                         logger.warning(
                             "Skipping API search for customid (will need manual review): %s",
-                                       lookup_id_collection
-                                       )
+                            lookup_id_collection
+                        )
                     else:
                         # Unknown format - log a warning
                         logger.error(
@@ -705,7 +798,14 @@ class InfobaseMARCProcessor:
         output_path = Path(output_file)
         with open(output_path, 'w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file, delimiter='\t')
-            writer.writerow(['lookupIDcollection', 'discovery-api-search'])
+            writer.writerow([
+                'lookupIDcollection',
+                'discovery-api-search',
+                'au-fragment',
+                'se-fragment',
+                'mn-review-flag',
+                'au-review-flag',
+            ])
             writer.writerows(search_terms)
 
         logger.info("Generated %s search terms (xtid only) in %s", len(search_terms), output_file)
