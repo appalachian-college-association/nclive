@@ -12,6 +12,7 @@ Features:
 4. Process manual updates to create InfobaseLookup_final.csv
 5. FOD/JFK breakdown statistics
 """
+# pylint: disable=too-many-lines
 
 import csv
 import re
@@ -84,6 +85,7 @@ class ExtendedMARCProcessor:
             'series_matches_found': 0,
             'infobase_id_matches_found': 0,
             'no_matches_found': 0,
+            'corporate_name_matches_found': 0,
             'api_errors': 0
         }
 
@@ -241,20 +243,21 @@ class ExtendedMARCProcessor:
         if not title:
             return []
         try:
-            token = self.get_token_cached()
+            # token = self.get_token_cached()
             # Clean and format title for search
             clean_title = self.clean_title_for_search(title)
             if not clean_title:
                 return []
             # Build query - search for electronic video format with title
-            query = f'ti:"{clean_title}" AND x4:digital'
+            query = f'ti:"{clean_title}"'
             headers = {
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {self.get_token_cached()}",
                 "Accept": "application/json"
             }
             params = {
                 "q": query, 
-                "limit": max_results
+                "limit": max_results,
+                "itemSubType": "video-digital",
             }
             if RESTRICT_TO_LIBRARY:
                 params["heldByLibrary"] = DEFAULT_LIBRARY
@@ -305,8 +308,8 @@ class ExtendedMARCProcessor:
 
             # Search both title field and series field for the series name
             queries = [
-                f'ti:"{series}" AND x4:digital',  # Series as title
-                f'se:"{series}" AND x4:digital',  # Series field (if available)
+                f'se:"{series}"',   # Series field (MARC 830)
+                f'ti:"{series}"',   # Series name searched as title
             ]
 
             all_results = []
@@ -318,7 +321,8 @@ class ExtendedMARCProcessor:
                 }
                 params = {
                     "q": query, 
-                    "limit": max_results
+                    "limit": max_results,
+                    "itemSubType": "video-digital",
                 }
 
                 if RESTRICT_TO_LIBRARY:
@@ -402,18 +406,19 @@ class ExtendedMARCProcessor:
 
             numeric_id = xtid_match.group(1)
 
-            # Build query similar to main.py but without kw:Infobase
-            # Original main.py query: "x4:digital AND kw:Infobase AND (sn:296504)"
-            # Modified query: "x4:digital AND (sn:296504)"
-            query = f'x4:digital AND (sn:{numeric_id})'
+            # Build query using mn: (MARC 028$a / publisher number) — correct index
+            # pb: limit results and rely on fallbacks for missed matches
+            # itemSubType=video-digital is passed as a separate URL parameter (not in q=)
+            query = f'mn:{numeric_id} AND pb:Infobase'
 
             headers = {
                 "Authorization": f"Bearer {self.get_token_cached()}",
                 "Accept": "application/json"
             }
             params = {
-                "q": query, 
-                "limit": max_results
+                "q": query,
+                "limit": max_results,
+                "itemSubType": "video-digital",
             }
 
             if RESTRICT_TO_LIBRARY:
