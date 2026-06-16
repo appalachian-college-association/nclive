@@ -881,6 +881,12 @@ class InfobaseMARCProcessor:
             results_df = pd.read_csv(
                 oclc_results_file, dtype={'oclcNumber': 'str', 'lookupID': 'str'}
             )
+            # Drop placeholder rows written by main.py for skipped/unmatched records.
+            # Those rows have an empty oclcNumber; storing them would override the
+            # correct MANUAL_REVIEW routing in _resolve_verified_ocn_and_source.
+            results_df = results_df[
+                results_df['oclcNumber'].fillna('').str.strip() != ''
+            ]
             new_oclc_data = {}
             for lookup_id_from_csv, group in results_df.groupby('lookupID'):
                 base_lookup_id = (
@@ -1063,7 +1069,7 @@ class InfobaseMARCProcessor:
             return str(video_digital.iloc[0]['oclcNumber']).strip()
 
         # Strategy 2: Prefer entries where isElectronicVideo == "Yes"
-        electronic_videos = oclc_group[oclc_group['isElectronicVideo'] == 'Yes']
+        electronic_videos = oclc_group[oclc_group['isElectronicVideo'] == 'True']
 
         if len(electronic_videos) == 1:
             logger.debug("Selected electronic video match for %s", lookup_id)
