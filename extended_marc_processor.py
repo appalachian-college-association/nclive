@@ -14,16 +14,15 @@ Features:
 """
 
 import csv
-import pandas as pd
 import re
-import requests
+import sys
 import time
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from datetime import datetime
-import json
-from urllib.parse import quote
+import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 # Import authentication from existing project
@@ -49,7 +48,7 @@ except ImportError:
     RESTRICT_TO_LIBRARY = False # Fallback to global search
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, 
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -58,8 +57,8 @@ class ExtendedMARCProcessor:
     Extended processor for handling manual review items with enhanced OCLC searches.
     Simplified version - KBART processing moved to separate files.
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  updated_lookup_file: str = "InfobaseLookup_updated.csv",
                  manual_review_output: str = "manual_review_searches.csv"):
         """
@@ -71,11 +70,11 @@ class ExtendedMARCProcessor:
         """
         self.updated_lookup_file = Path(updated_lookup_file)
         self.manual_review_output = Path(manual_review_output)
-        
+
         # Storage for data
         self.manual_review_records = []
         self.extended_search_results = []
-        
+
         # Statistics tracking
         self.stats = {
             'total_manual_review': 0,
@@ -87,10 +86,10 @@ class ExtendedMARCProcessor:
             'no_matches_found': 0,
             'api_errors': 0
         }
-        
+
         # Authentication token (will be set when needed)
         self.access_token = None
-    
+
     def load_manual_review_items(self) -> List[Dict]:
         """
         Load items marked for manual review from InfobaseLookup_updated.csv.
@@ -98,44 +97,49 @@ class ExtendedMARCProcessor:
         Returns:
             List of records needing manual review
         """
-        logger.info(f"Loading manual review items from {self.updated_lookup_file}")
-        
+        logger.info("Loading manual review items from %s", self.updated_lookup_file)
+
         if not self.updated_lookup_file.exists():
-            logger.error(f"File not found: {self.updated_lookup_file}")
+            logger.error("File not found: %s", self.updated_lookup_file)
             return []
-        
+
         try:
             df = pd.read_csv(self.updated_lookup_file, dtype=oclc_dtypes, keep_default_na=False)
-            
+
             # Filter for manual review items
             manual_review_df = df[
-                (df['verifiedOCN'] == 'X') | 
+                (df['verifiedOCN'] == 'X') |
                 (df['source'] == 'MANUAL_REVIEW')
             ].copy()
-            
+
             self.manual_review_records = manual_review_df.to_dict('records')
-            
+
             # Calculate statistics
             self.stats['total_manual_review'] = len(self.manual_review_records)
-            self.stats['fod_manual_review'] = len(manual_review_df[manual_review_df['collection_type'] == 'fod'])
-            self.stats['jfk_manual_review'] = len(manual_review_df[manual_review_df['collection_type'] == 'jfk'])
-            
-            logger.info(f"Loaded {self.stats['total_manual_review']} manual review items")
-            logger.info(f"  - FOD: {self.stats['fod_manual_review']}")
-            logger.info(f"  - JFK: {self.stats['jfk_manual_review']}")
-            
+            self.stats['fod_manual_review'] = (
+                len(manual_review_df[manual_review_df['collection_type'] == 'fod'])
+            )
+            self.stats['jfk_manual_review'] = (
+                len(manual_review_df[manual_review_df['collection_type'] == 'jfk'])
+            )
+
+            logger.info("Loaded %s manual review items", self.stats['total_manual_review'])
+            logger.info("  - FOD: %s", self.stats['fod_manual_review'])
+            logger.info("  - JFK: %s", self.stats['jfk_manual_review'])
+
             return self.manual_review_records
-            
-        except Exception as e:
-            logger.error(f"Error loading manual review items: {e}")
+
+        except (
+            pd.errors.ParserError, KeyError, ValueError) as e:
+            logger.error("Error loading manual review items: %s", e)
             return []
-    
+
     def clean_text_for_export(self, text: str) -> str:
         """Clean text for OpenRefine compatibility"""
         if not text:
             return text
         return str(text).replace('#', '[hashmark]')
-    
+
     def extract_series_from_title(self, title: str) -> Optional[str]:
         """
         Extract series name from title with parenthetical information.
@@ -157,18 +161,22 @@ class ExtendedMARCProcessor:
             r'\(Series:\s*([^)]+)\)$',   # Matches "(Series: Something)"
             r'\(([^)]{10,})\)$',         # Matches long parenthetical (likely series)
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, title.strip(), re.IGNORECASE)
             if match:
                 series_candidate = match.group(1).strip()
                 # Clean up common prefixes/suffixes
-                series_candidate = re.sub(r'^(Series:\s*|The\s+)', '', series_candidate, flags=re.IGNORECASE)
-                series_candidate = re.sub(r'\s+Series$', '', series_candidate, flags=re.IGNORECASE)
+                series_candidate = re.sub(
+                    r'^(Series:\s*|The\s+)', '', series_candidate, flags=re.IGNORECASE
+                    )
+                series_candidate = re.sub(
+                    r'\s+Series$', '', series_candidate, flags=re.IGNORECASE
+                    )
                 return series_candidate
-        
+
         return None
-    
+
     def clean_title_for_search(self, title: str) -> str:
         """
         Clean title for OCLC search by removing problematic characters and formatting.
@@ -181,24 +189,24 @@ class ExtendedMARCProcessor:
         """
         if not title:
             return ""
-        
+
         # Remove parenthetical information (often contains series info)
         cleaned = re.sub(r'\([^)]+\)', '', title)
-        
+
         # Remove subtitles after colon (but keep main title)
         cleaned = cleaned.split(':')[0].strip()
-        
+
         # Remove common punctuation that can cause search issues
         cleaned = re.sub(r'[^\w\s\-]', ' ', cleaned)
-        
+
         # Normalize whitespace
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        
+
         # Remove leading/trailing articles for better matching
         cleaned = re.sub(r'^(The|A|An)\s+', '', cleaned, flags=re.IGNORECASE)
-        
+
         return cleaned
-    
+
     def get_token_cached(self) -> str:
         """
         Get OCLC API access token with caching.
@@ -209,17 +217,16 @@ class ExtendedMARCProcessor:
         if self.access_token is None:
             try:
                 # Create OCLCAuth class instance and get token
-                auth_handler = OCLCAuth()
                 self.access_token = auth_handler.get_valid_token()
                 if not self.access_token:
                     raise ValueError("Failed to obtain valid token")
                 logger.info("Successfully obtained OCLC API access token")
             except Exception as e:
-                logger.error(f"Failed to get access token: {e}")
+                logger.error("Failed to get access token: %s", e)
                 raise
-        
+
         return self.access_token
-    
+
     def search_oclc_by_title(self, title: str, max_results: int = 5) -> List[Dict]:
         """
         Search OCLC Discovery API by title.
@@ -233,18 +240,14 @@ class ExtendedMARCProcessor:
         """
         if not title:
             return []
-        
         try:
             token = self.get_token_cached()
-            
             # Clean and format title for search
             clean_title = self.clean_title_for_search(title)
             if not clean_title:
                 return []
-            
             # Build query - search for electronic video format with title
             query = f'ti:"{clean_title}" AND x4:digital'
-            
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json"
@@ -253,24 +256,21 @@ class ExtendedMARCProcessor:
                 "q": query, 
                 "limit": max_results
             }
-            
             if RESTRICT_TO_LIBRARY:
                 params["heldByLibrary"] = DEFAULT_LIBRARY
-                logger.debug(f"Restricting search to library {DEFAULT_LIBRARY}")
+                logger.debug("Restricting search to library %s", DEFAULT_LIBRARY)
             else:
-                logger.debug(f"Performing global search (all libraries)")
+                logger.debug("Performing global search (all libraries)")
 
-            logger.info(f"Searching OCLC by title: {query}")
-            response = requests.get(API_URL, headers=headers, params=params)
+            logger.info("Searching OCLC by title: %s", query)
+            response = requests.get(API_URL, headers=headers, params=params, timeout=(10,30))
             response.raise_for_status()
-            
             data = response.json()
             records = data.get("briefRecords", [])
-            
             # Filter for electronic videos
             video_records = []
             for record in records:
-                if (record.get("generalFormat") == "Video" and 
+                if (record.get("generalFormat") == "Video" and
                     record.get("specificFormat") == "Digital"):
                     video_records.append({
                         'oclc_number': record.get("oclcNumber", ""),
@@ -279,14 +279,13 @@ class ExtendedMARCProcessor:
                         'specific_format': record.get("specificFormat", ""),
                         'search_type': 'title_search'
                     })
-            
             return video_records
-            
-        except Exception as e:
-            logger.error(f"Error searching by title '{title}': {e}")
+
+        except requests.exceptions.RequestException as e:
+            logger.error("Error searching by title '%s': %s", title, e)
             self.stats['api_errors'] += 1
             return []
-    
+
     def search_oclc_by_series(self, series: str, max_results: int = 3) -> List[Dict]:
         """
         Search OCLC Discovery API by series name.
@@ -300,18 +299,18 @@ class ExtendedMARCProcessor:
         """
         if not series:
             return []
-        
+
         try:
             token = self.get_token_cached()
-            
+
             # Search both title field and series field for the series name
             queries = [
                 f'ti:"{series}" AND x4:digital',  # Series as title
                 f'se:"{series}" AND x4:digital',  # Series field (if available)
             ]
-            
+
             all_results = []
-            
+
             for query in queries:
                 headers = {
                     "Authorization": f"Bearer {token}",
@@ -324,20 +323,20 @@ class ExtendedMARCProcessor:
 
                 if RESTRICT_TO_LIBRARY:
                     params["heldByLibrary"] = DEFAULT_LIBRARY
-                    logger.debug(f"Restricting search to library {DEFAULT_LIBRARY}")
+                    logger.debug("Restricting search to library %s", DEFAULT_LIBRARY)
                 else:
-                    logger.debug(f"Performing global search (all libraries)")
-                
-                logger.info(f"Searching OCLC by series: {query}")
-                response = requests.get(API_URL, headers=headers, params=params)
+                    logger.debug("Performing global search (all libraries)")
+
+                logger.info("Searching OCLC by series: %s", query)
+                response = requests.get(API_URL, headers=headers, params=params, timeout=(10,30))
                 response.raise_for_status()
-                
+
                 data = response.json()
                 records = data.get("briefRecords", [])
-                
+
                 # Filter for electronic videos
                 for record in records:
-                    if (record.get("generalFormat") == "Video" and 
+                    if (record.get("generalFormat") == "Video" and
                         record.get("specificFormat") == "Digital"):
                         result = {
                             'oclc_number': record.get("oclcNumber", ""),
@@ -346,21 +345,21 @@ class ExtendedMARCProcessor:
                             'specific_format': record.get("specificFormat", ""),
                             'search_type': 'series_search'
                         }
-                        
+
                         # Avoid duplicates
                         if not any(r['oclc_number'] == result['oclc_number'] for r in all_results):
                             all_results.append(result)
-                
+
                 # Brief pause between queries
                 time.sleep(0.5)
-            
+
             return all_results[:max_results]  # Limit total results
-            
-        except Exception as e:
-            logger.error(f"Error searching by series '{series}': {e}")
+
+        except requests.exceptions.RequestException as e:
+            logger.error("Error searching by series '%s': %s", series, e)
             self.stats['api_errors'] += 1
             return []
-    
+
     def search_oclc_by_infobase_id(self, lookup_id: str, max_results: int = 5) -> List[Dict]:
         """
         Search OCLC Discovery API using the main.py query format without kw:Infobase.
@@ -379,27 +378,28 @@ class ExtendedMARCProcessor:
 
         if not lookup_id:
             return []
-        
+
         try:
-            token = self.get_token_cached()
+            # token = self.get_token_cached()
+            # replaced in f-string for Authorization header (DELETE after testing)
 
             # Extract numeric ID from lookup_id format
             # ONLY search on xtid values - these correspond to MARC 028 fields
             xtid_match = re.search(r'xtid=(.+)\$', lookup_id)
-							
-																						   
-						 
-            
+
             if not xtid_match:
                 # Check if this is a customid - these should NOT be searched via sn:
                 customid_match = re.search(r'customid=(.+)\$', lookup_id)
                 if customid_match:
-                    logger.warning(f"Skipping infobase ID search for customid (doesn't match MARC 028): {lookup_id}")
+                    logger.warning(
+                        "Skipping infobase ID search for customid (doesn't match MARC 028): %s",
+                        lookup_id
+                        )
                     return []  # Return empty - customid can't be searched this way
-                else:
-                    logger.warning(f"Could not extract xtid from lookup_id: {lookup_id}")
-                    return []
-            
+
+                logger.warning("Could not extract xtid from lookup_id: %s", lookup_id)
+                return []
+
             numeric_id = xtid_match.group(1)
 
             # Build query similar to main.py but without kw:Infobase
@@ -408,7 +408,7 @@ class ExtendedMARCProcessor:
             query = f'x4:digital AND (sn:{numeric_id})'
 
             headers = {
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {self.get_token_cached()}",
                 "Accept": "application/json"
             }
             params = {
@@ -418,12 +418,12 @@ class ExtendedMARCProcessor:
 
             if RESTRICT_TO_LIBRARY:
                 params["heldByLibrary"] = DEFAULT_LIBRARY
-                logger.debug(f"Restricting search to library {DEFAULT_LIBRARY}")
+                logger.debug("Restricting search to library %s", DEFAULT_LIBRARY)
             else:
-                logger.debug(f"Performing global search (all libraries)")
+                logger.debug("Performing global search (all libraries)")
 
-            logger.info(f"Searching OCLC by infobase query: {query}")
-            response = requests.get(API_URL, headers=headers, params=params)
+            logger.info("Searching OCLC by infobase query: %s", query)
+            response = requests.get(API_URL, headers=headers, params=params, timeout=(10,30))
             response.raise_for_status()
 
             data = response.json()
@@ -432,7 +432,7 @@ class ExtendedMARCProcessor:
             # Filter for digital videos (same as other search methods)
             video_records = []
             for record in records:
-                if (record.get("generalFormat") == "Video" and 
+                if (record.get("generalFormat") == "Video" and
                 record.get("specificFormat") == "Digital"):
                     video_records.append({
                         'oclc_number': record.get("oclcNumber", ""),
@@ -443,12 +443,12 @@ class ExtendedMARCProcessor:
                     })
 
             return video_records
-        
-        except Exception as e:
-            logger.error(f"Error searching by infobase query '{lookup_id}': {e}")
+
+        except requests.exceptions.RequestException as e:
+            logger.error("Error searching by infobase query '%s': %s", lookup_id, e)
             self.stats['api_errors'] += 1
             return []
-    
+
     def perform_extended_searches(self) -> List[Dict]:
         """
         Perform extended OCLC searches on all manual review items.
@@ -457,23 +457,25 @@ class ExtendedMARCProcessor:
             List of extended search results
         """
         logger.info("Performing extended OCLC searches...")
-        
+
         if not self.manual_review_records:
             logger.warning("No manual review records to search")
             return []
-        
+
         results = []
-        
+
         for i, record in enumerate(self.manual_review_records, 1):
-            logger.info(f"Processing record {i}/{len(self.manual_review_records)}: {record.get('title', '')[:50]}...")
-            
+            logger.info(
+                "Processing record %s/%s:%s...",
+                i, len(self.manual_review_records), record.get('title', '')[:50]
+                )
+
             title = record.get('title', '')
             lookup_id = record.get('lookupID', '')
             collection_type = record.get('collection_type', '')
-            
+
             # Extract series from title if present
             series_name = self.extract_series_from_title(title)
-            
             search_result = {
                 'original_lookup_id': lookup_id,
                 'original_title': title,
@@ -484,7 +486,7 @@ class ExtendedMARCProcessor:
                 'infobase_id_matches': [],
                 'recommended_action': 'NO_MATCH'
             }
-            
+
             # 1. Search by infobase ID (main.py query without kw:Infobase)
             infobase_id_matches = self.search_oclc_by_infobase_id(lookup_id)
             search_result['infobase_id_matches'] = infobase_id_matches
@@ -492,44 +494,46 @@ class ExtendedMARCProcessor:
             if infobase_id_matches:
                 self.stats['infobase_id_matches_found'] += 1
                 search_result['recommended_action'] = 'INFOBASE_ID_MATCH'
-                logger.info(f"  Found {len(infobase_id_matches)} infobase id matches")           
-            
+                logger.info("  Found %s infobase id matches", len(infobase_id_matches))
+
             # 2. Search by title
             title_matches = self.search_oclc_by_title(title)
             search_result['title_matches'] = title_matches
-            
+
             if title_matches:
                 self.stats['title_matches_found'] += 1
                 if not infobase_id_matches:    # Only recommend title if no ID match
                     search_result['recommended_action'] = 'TITLE_MATCH'
-                logger.info(f"  Found {len(title_matches)} title matches")
-            
+                logger.info("  Found %s title matches", len(title_matches))
+
             # 3. Search by series (if extracted)
             series_matches = []
             if series_name:
                 series_matches = self.search_oclc_by_series(series_name)
                 search_result['series_matches'] = series_matches
-                
+
                 if series_matches:
                     self.stats['series_matches_found'] += 1
-                    if not infobase_id_matches and not title_matches:  # Only recommend series if no id or title match
+                    # Only recommend series if no id or title match
+                    if not infobase_id_matches and not title_matches:
                         search_result['recommended_action'] = 'SERIES_MATCH'
-                    logger.info(f"  Found {len(series_matches)} series matches for '{series_name}'")
-            
-            
+                    logger.info(
+                        "  Found %s series matches for '%s'", len(series_matches), series_name
+                        )
+
             # Track no matches
             if not infobase_id_matches and not title_matches and not series_matches:
                 self.stats['no_matches_found'] += 1
-                logger.info(f"  No matches found")
-            
+                logger.info("  No matches found")
+
             results.append(search_result)
-            
+
             # Rate limiting - pause between searches
             time.sleep(1)
-        
+
         self.extended_search_results = results
         return results
-    
+
     def create_manual_review_file(self, output_file: str = None) -> str:
         """
         Create manual review file with extended search results.
@@ -542,31 +546,38 @@ class ExtendedMARCProcessor:
         """
         if output_file is None:
             output_file = self.manual_review_output
-        
-        logger.info(f"Creating manual review file: {output_file}")
-        
+
+        logger.info("Creating manual review file: %s", output_file)
+
         # Flatten results for CSV output
         csv_records = []
-        
+
         for result in self.extended_search_results:
             # Extract lookup_id and build infobase link
             lookup_id = result['original_lookup_id']  # e.g., "xtid=296504$"
             collection_type = result['collection_type']  # e.g., "fod" or "jfk"
-    
+
             # Build infobase link
             infobase_link = ""
             if lookup_id:
                 # Remove the "$" from the end
                 clean_lookup_id = lookup_id.rstrip('$')  # "xtid=296504$ becomes "xtid=296504"
-        
+
                 # Build URL based on collection type
                 if collection_type == 'fod':
-                    infobase_link = f"https://fod.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"
+                    infobase_link = (
+                        f"https://fod.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"
+                    )
                 elif collection_type == 'jfk':
-                    infobase_link = f"https://jfk.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"
+                    infobase_link = (
+                        f"https://jfk.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"
+                    )
                 else:
-                    infobase_link = f"https://fod.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"  # default to FOD
-    
+                    # default to FOD
+                    infobase_link = (
+                        f"https://fod.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"
+                    )
+
             base_record = {
                 'original_lookup_id': result['original_lookup_id'],
                 'original_title': result['original_title'],
@@ -575,7 +586,7 @@ class ExtendedMARCProcessor:
                 'recommended_action': result['recommended_action'],
                 'infobase_link': infobase_link  # Add the constructed link here
             }
-            
+
             # Priority logic: only add the FIRST match from best match typle
             # Add Infobase ID matches
             if result['infobase_id_matches']:
@@ -607,7 +618,7 @@ class ExtendedMARCProcessor:
                     'accept_suggestion': ''  # To be filled in manually
                 })
                 csv_records.append(record)
-            
+
             # Add series matches
             elif result['series_matches']:
                 match = result['series_matches'][0]
@@ -618,12 +629,13 @@ class ExtendedMARCProcessor:
                     'suggested_oclc': match['oclc_number'],
                     'suggested_title': match['title'],
                     'match_format': f"{match['general_format']}-{match['specific_format']}",
-                    'manual_review_notes': f'Series-level match for: {result.get("extracted_series", "")}',
+                    'manual_review_notes': f'Series-level match for: '
+                    f'{result.get("extracted_series", "")}',
                     'verifiedOCN': '',  # To be filled in manually
                     'accept_suggestion': ''  # To be filled in manually
                 })
                 csv_records.append(record)
-            
+
             # Add no-match record
             else:
                 record = base_record.copy()
@@ -638,7 +650,7 @@ class ExtendedMARCProcessor:
                     'accept_suggestion': ''  # To be filled in manually
                 })
                 csv_records.append(record)
-        
+
         # Write CSV
         with open(output_file, 'w', newline='', encoding='utf-8') as file:
             if csv_records:
@@ -655,12 +667,13 @@ class ExtendedMARCProcessor:
                 ]
                 writer = csv.DictWriter(file, fieldnames=headers)
                 writer.writeheader()
-        
-        logger.info(f"Created manual review file with {len(csv_records)} records")
-        return str(output_file)    
-   
-    def process_manual_review_updates(self, reviewed_file: str, 
-                                    updated_lookup_output: str = "InfobaseLookup_final.csv") -> str:
+
+        logger.info("Created manual review file with %s records", len(csv_records))
+        return str(output_file)
+
+    def process_manual_review_updates(
+            self, reviewed_file: str,
+            updated_lookup_output: str = "InfobaseLookup_final.csv") -> str:
         """
         Process manually reviewed file and update lookup data.
         FIXED VERSION - Handles duplicate title IDs correctly using lookupIDcollection.
@@ -672,28 +685,30 @@ class ExtendedMARCProcessor:
         Returns:
             Path to updated lookup file
         """
-        logger.info(f"Processing manual review updates from {reviewed_file}")
-        
+        logger.info("Processing manual review updates from %s", reviewed_file)
+
         # Load the reviewed file
         try:
             reviewed_df = pd.read_csv(reviewed_file, dtype=oclc_dtypes, keep_default_na=False)
-        except Exception as e:
-            logger.error(f"Could not load reviewed file: {e}")
+        except (pd.errors.ParserError, KeyError, ValueError) as e:
+            logger.error("Could not load reviewed file: %s", e)
             return None
-        
+
         # Load original lookup file
         try:
-            original_df = pd.read_csv(self.updated_lookup_file, dtype=oclc_dtypes, keep_default_na=False)
-        except Exception as e:
-            logger.error(f"Could not load original lookup file: {e}")
+            original_df = pd.read_csv(
+                self.updated_lookup_file, dtype=oclc_dtypes, keep_default_na=False
+                )
+        except (OSError, pd.errors.ParserError, KeyError, ValueError) as e:
+            logger.error("Could not load original lookup file: %s", e)
             return None
-        
+
         # Process accepted suggestions
         accepted_updates = {}
-        
+
         for _, row in reviewed_df.iterrows():
             accept_suggestion = str(row.get('accept_suggestion', '')).strip().lower()
-            lookup_id = row.get('original_lookup_id', '')  # This is base lookupID like "xtid=93331$"
+            lookup_id = row.get('original_lookup_id', '')
             collection_type = row.get('collection_type', '')  # This tells us fod or jfk
             match_type = row.get('match_type', '')
 
@@ -706,7 +721,7 @@ class ExtendedMARCProcessor:
                 if suggested_oclc and suggested_oclc.lower() not in ['', 'nan', 'null']:
                     oclc_number = suggested_oclc
 
-            # Second priority: Check if we have a manually entered verifiedOCN (regardless of accept_suggestion)
+            # Second priority: Check if we have a manually entered verifiedOCN
             if not oclc_number:
                 verified_ocn = str(row.get('verifiedOCN', '')).strip()
                 if verified_ocn and verified_ocn.lower() not in ['', 'nan', 'null']:
@@ -718,7 +733,7 @@ class ExtendedMARCProcessor:
             if lookup_id and oclc_number and accept_suggestion in ['yes', 'y', '1', 'true']:
                 # FIXED: Create the full lookupIDcollection for proper matching
                 lookup_id_collection = f"{lookup_id}{collection_type}"
-                
+
                 # Determine source label
                 if match_type == "INFOBASE_ID_MATCH":
                     source = 'API_INFOBASE_ID'
@@ -730,21 +745,24 @@ class ExtendedMARCProcessor:
                     source = 'MANUAL_ENTRY'  # For manually entered OCLC numbers
                 else:
                     source = 'API_EXT_SEARCH'
-                
+
                 # FIXED: Use lookupIDcollection as the key instead of just lookupID
                 accepted_updates[lookup_id_collection] = {
                     'verifiedOCN': oclc_number,
                     'source': source,
                     'base_lookup_id': lookup_id  # Keep base ID for logging
                 }
-                
-                logger.info(f"Accepted update for {lookup_id_collection}: {oclc_number} (source: {source})")
-        
-        logger.info(f"Processing {len(accepted_updates)} accepted updates")
-        
+
+                logger.info(
+                    "Accepted update for %s,: %s (source: %s)",
+                    lookup_id_collection, oclc_number, source
+                )
+
+        logger.info("Processing %s accepted updates", len(accepted_updates))
+
         # Update original lookup data
         updated_df = original_df.copy()
-        
+
         # FIXED: Use lookupIDcollection for matching instead of lookupID
         for lookup_id_collection, updates in accepted_updates.items():
             mask = updated_df['lookupIDcollection'] == lookup_id_collection
@@ -752,7 +770,9 @@ class ExtendedMARCProcessor:
                 updated_df.loc[mask, 'verifiedOCN'] = updates['verifiedOCN']
                 updated_df.loc[mask, 'source'] = updates['source']
                 updated_df.loc[mask, 'last_updated'] = datetime.now().strftime('%Y-%m-%d')
-                logger.info(f"Updated {lookup_id_collection} with OCLC {updates['verifiedOCN']}")
+                logger.info("Updated %s with OCLC %s",
+                            lookup_id_collection, updates['verifiedOCN']
+                            )
             else:
                 # Try fallback to base lookupID matching (for backwards compatibility)
                 base_lookup_id = updates['base_lookup_id']
@@ -760,35 +780,55 @@ class ExtendedMARCProcessor:
                 if mask_fallback.any():
                     # If multiple matches (duplicate title IDs), warn user
                     if mask_fallback.sum() > 1:
-                        logger.warning(f"Multiple matches found for {base_lookup_id}. Manual review may be needed.")
-                        logger.warning(f"Matches found: {updated_df[mask_fallback]['lookupIDcollection'].tolist()}")
+                        logger.warning("Multiple matches found for %s."
+                                       "Manual review may be needed.",
+                                       {base_lookup_id}
+                                       )
+                        logger.warning(
+                            "Matches found: %s",
+                            {updated_df[mask_fallback]['lookupIDcollection'].tolist()}
+                            )
                         # Apply update to all matches (may not be ideal, but prevents data loss)
                         updated_df.loc[mask_fallback, 'verifiedOCN'] = updates['verifiedOCN']
                         updated_df.loc[mask_fallback, 'source'] = updates['source']
-                        updated_df.loc[mask_fallback, 'last_updated'] = datetime.now().strftime('%Y-%m-%d')
-                        logger.warning(f"Applied update to all {mask_fallback.sum()} matches for {base_lookup_id}")
+                        updated_df.loc[mask_fallback, 'last_updated'] = datetime.now().strftime(
+                            '%Y-%m-%d')
+                        logger.warning(
+                            "Applied update to all %s matches for %s",
+                            mask_fallback.sum(),base_lookup_id
+                            )
                     else:
                         # Single match - safe to update
                         updated_df.loc[mask_fallback, 'verifiedOCN'] = updates['verifiedOCN']
                         updated_df.loc[mask_fallback, 'source'] = updates['source']
-                        updated_df.loc[mask_fallback, 'last_updated'] = datetime.now().strftime('%Y-%m-%d')
-                        logger.info(f"Updated {base_lookup_id} (fallback match) with OCLC {updates['verifiedOCN']}")
+                        updated_df.loc[mask_fallback, 'last_updated'] = datetime.now().strftime(
+                            '%Y-%m-%d'
+                            )
+                        logger.info("Updated %s (fallback match) with OCLC %s",
+                                    base_lookup_id, updates['verifiedOCN']
+                                    )
                 else:
-                    logger.warning(f"Could not find lookup_id {lookup_id_collection} or {base_lookup_id} in original data")
-        
+                    logger.warning(
+                        "Could not find lookup_id %s or %s in original data",
+                        lookup_id_collection, base_lookup_id
+                        )
+
         # DIAGNOSTIC: Check for any remaining "X" values
         remaining_x_count = len(updated_df[updated_df['verifiedOCN'] == 'X'])
         if remaining_x_count > 0:
-            logger.info(f"After manual review processing: {remaining_x_count} items still marked for manual review ('X')")
+            logger.info(
+                "After manual review processing: %s items still marked for manual review ('X')",
+                {remaining_x_count}
+                )
         else:
             logger.info("All manual review items have been processed - no 'X' values remaining")
-        
+
         # Save updated lookup file
         updated_df.to_csv(updated_lookup_output, index=False)
-        logger.info(f"Saved updated lookup file: {updated_lookup_output}")
-        
+        logger.info("Saved updated lookup file: %s", updated_lookup_output)
+
         return str(updated_lookup_output)
-    
+
     def generate_statistics_report(self, output_file: str = "extended_search_stats.txt") -> str:
         """
         Generate detailed statistics report with FOD/JFK breakdown.
@@ -799,31 +839,31 @@ class ExtendedMARCProcessor:
         Returns:
             Path to statistics report
         """
-        logger.info(f"Generating statistics report: {output_file}")
-        
+        # pylint: disable=too-many-locals
+        logger.info("Generating statistics report: %s", output_file)
+
         # Calculate additional statistics
-        fod_id_matches = sum(1 for r in self.extended_search_results 
+        fod_id_matches = sum(1 for r in self.extended_search_results
                                if r['collection_type'] == 'fod' and r['infobase_id_matches'])
-        jfk_id_matches = sum(1 for r in self.extended_search_results 
+        jfk_id_matches = sum(1 for r in self.extended_search_results
                                if r['collection_type'] == 'jfk' and r['infobase_id_matches'])
-        
-        fod_title_matches = sum(1 for r in self.extended_search_results 
+        fod_title_matches = sum(1 for r in self.extended_search_results
                                if r['collection_type'] == 'fod' and r['title_matches'])
-        jfk_title_matches = sum(1 for r in self.extended_search_results 
+        jfk_title_matches = sum(1 for r in self.extended_search_results
                                if r['collection_type'] == 'jfk' and r['title_matches'])
-        
-        fod_series_matches = sum(1 for r in self.extended_search_results 
+        fod_series_matches = sum(1 for r in self.extended_search_results
                                 if r['collection_type'] == 'fod' and r['series_matches'])
-        jfk_series_matches = sum(1 for r in self.extended_search_results 
+        jfk_series_matches = sum(1 for r in self.extended_search_results
                                 if r['collection_type'] == 'jfk' and r['series_matches'])
-        
-        fod_no_matches = sum(1 for r in self.extended_search_results 
-                            if r['collection_type'] == 'fod' and 
-                            not r['infobase_id_matches'] and not r['title_matches'] and not r['series_matches'])
-        jfk_no_matches = sum(1 for r in self.extended_search_results 
-                            if r['collection_type'] == 'jfk' and 
-                            not r['infobase_id_matches'] and not r['title_matches'] and not r['series_matches'])
-        
+        fod_no_matches = sum(1 for r in self.extended_search_results
+                            if r['collection_type'] == 'fod' and
+                            not r['infobase_id_matches'] and not
+                            r['title_matches'] and not r['series_matches'])
+        jfk_no_matches = sum(1 for r in self.extended_search_results
+                            if r['collection_type'] == 'jfk' and not
+                            r['infobase_id_matches'] and not
+                            r['title_matches'] and not r['series_matches'])
+
         # Create report
         report_lines = [
             "="*80,
@@ -853,102 +893,105 @@ class ExtendedMARCProcessor:
             "",
             "SUCCESS RATES:",
         ]
-        
+
         if self.stats['total_manual_review'] > 0:
-            overall_success_rate = ((self.stats['infobase_id_matches_found'] + self.stats['title_matches_found'] + self.stats['series_matches_found']) / 
+            overall_success_rate = ((
+                self.stats['infobase_id_matches_found'] +
+                self.stats['title_matches_found'] +
+                self.stats['series_matches_found']) /
                                   self.stats['total_manual_review']) * 100
             report_lines.append(f"  Overall match rate: {overall_success_rate:.1f}%")
-            
+
             if self.stats['fod_manual_review'] > 0:
-                fod_success_rate = ((fod_title_matches + fod_series_matches) / 
+                fod_success_rate = ((fod_title_matches + fod_series_matches) /
                                   self.stats['fod_manual_review']) * 100
                 report_lines.append(f"  FOD match rate: {fod_success_rate:.1f}%")
-            
+
             if self.stats['jfk_manual_review'] > 0:
-                jfk_success_rate = ((jfk_title_matches + jfk_series_matches) / 
+                jfk_success_rate = ((jfk_title_matches + jfk_series_matches) /
                                   self.stats['jfk_manual_review']) * 100
                 report_lines.append(f"  JFK match rate: {jfk_success_rate:.1f}%")
-        
+
         # Write report
         with open(output_file, 'w', encoding='utf-8') as file:
             file.write('\n'.join(report_lines))
-        
+
         # Also print to console
         for line in report_lines:
             print(line)
-        
+
         return str(output_file)
 
 def main():
     """Main function to run extended manual review processing."""
     print("Extended MARC Processor - Manual Review Handler (Simplified)")
     print("=" * 65)
-    
+
     # Initialize processor
     processor = ExtendedMARCProcessor()
-    
+
     # Load manual review items
     manual_review_items = processor.load_manual_review_items()
-    
+
     if not manual_review_items:
         print("No manual review items found. Exiting.")
         return
-    
+
     # Perform extended searches
     print(f"\nPerforming extended OCLC searches on {len(manual_review_items)} items...")
-    search_results = processor.perform_extended_searches()
-    
+
     # Create manual review file
     manual_review_file = processor.create_manual_review_file()
     print(f"\n Created manual review file: {manual_review_file}")
-    
+
     # Generate statistics report
     stats_report = processor.generate_statistics_report()
     print(f"Generated statistics report: {stats_report}")
-    
-    print(f"\n Next Steps:")
+
+    print("\n Next Steps:")
     print(f"1. Review and edit: {manual_review_file}")
-    print(f"   - Update 'verifiedOCN' column with correct OCLC numbers")
-    print(f"   - Set 'accept_suggestion' to 'yes' for items to accept")
-    print(f"2. After manual review, run: python extended_marc_processor.py --process-updates {manual_review_file}")
-    print(f"3. This will generate InfobaseLookup_final.csv")
-    print(f"4. Then run: python kbart_integration.py for final KBART processing")
+    print("   - Update 'verifiedOCN' column with correct OCLC numbers")
+    print("   - Set 'accept_suggestion' to 'yes' for items to accept")
+    print(
+        "2. After manual review, run: python extended_marc_processor.py"
+        f" --process-updates {manual_review_file}"
+         )
+    print("3. This will generate InfobaseLookup_final.csv")
+    print("4. Then run: python kbart_integration.py for final KBART processing")
 
 def process_updates_main():
     """Process manually reviewed updates."""
-    import sys
-    
+
     if len(sys.argv) < 3:
         print("Usage: python extended_marc_processor.py --process-updates <reviewed_file>")
         return
-    
+
     reviewed_file = sys.argv[2]
-    
+
     print("Extended MARC Processor - Processing Manual Review Updates")
     print("=" * 60)
-    
+
     processor = ExtendedMARCProcessor()
-    
+
     # Process the manual review updates
     updated_lookup = processor.process_manual_review_updates(
         reviewed_file,
         "InfobaseLookup_final.csv"
     )
-    
+
     if updated_lookup:
-        print(f"\n Processing complete!")
-        print(f"Updated lookup file: {updated_lookup}")
-        print(f"\n Final Steps:")
-        print(f"1. Run: python kbart_integration.py")
-        print(f"   This will create the final KBART files using {updated_lookup}")
-        print(f"2. Run: python final_kbart_integration_reporting.py")
-        print(f"   For comprehensive reporting and validation")
+        print("\n Processing complete!")
+        print("Updated lookup file: {updated_lookup}")
+        print("\n Final Steps:")
+        print("1. Run: python kbart_integration.py")
+        print("   This will create the final KBART files using {updated_lookup}")
+        print("2. Run: python final_kbart_integration_reporting.py")
+        print("   For comprehensive reporting and validation")
     else:
         print("\n Error processing updates. Check logs for details.")
 
 if __name__ == "__main__":
-    import sys
-    
+
     if len(sys.argv) > 1 and sys.argv[1] == "--process-updates":
         process_updates_main()
     else:
