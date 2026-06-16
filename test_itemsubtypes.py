@@ -47,7 +47,7 @@ LOOKUP_FILE = "InfobaseLookup.csv"   # Relative to nclive root directory
 OUTPUT_FILE = "itemsubtype_counts.csv"
 NON_DIGITAL_FILE = "non_digital_ocns.csv"  # OCNs where specificFormat != "Digital"
 BATCH_SIZE = 10    # OCNs per API call; keep query string under ~3000 chars
-MAX_BATCHES = 100
+MAX_BATCHES = 6510
 SLEEP_BETWEEN_CALLS = 0.5  # Seconds to wait between API calls (be a good API citizen)
 
 # ---------------------------------------------------------------------------

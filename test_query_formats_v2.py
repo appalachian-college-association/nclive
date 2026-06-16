@@ -59,7 +59,21 @@ HEADERS = {
 }
 
 # The target standard number (xtid / publisher number) from your example
-TARGET_MN = "29596"
+TARGET_MN = "10049"
+# The target name (au:) from MARC 710a (take first (Firm), then clean)
+TARGET_AU = "Digital Classics Distribution"
+# The target series (se:) from MARC 830a (take first; skip if not exist)
+# Include f" AND {TARGET_SE}" for series to avoid blank se: entry that breaks search
+TARGET_SE = ""
+# The target title (ti:) from MARC 245a
+TARGET_TI = "David Malouf"
+# The target subtitle (ti:) from MARC 245b
+TARGET_SUB_TI = "an imaginary life"
+# The general publisher (pb:) search with TARGET_MN
+TARGET_PB = "Infobase OR Access OR Films"
+# Cataloging Agency (only acceptable use with MN only)
+TARGET_SA = "nyinf"
+
 
 # ---------------------------------------------------------------------------
 # Query variations
@@ -72,35 +86,43 @@ TARGET_MN = "29596"
 
 QUERY_VARIATIONS = [
     (
-        "1. Original approach: x4:digital in q= (should be blocked per API docs)",
-        f"x4:digital AND mn:{TARGET_MN}",
-        {},
+        # Instead of x4:digital with TARGET_MN, try SpecificFormat with CatalogingAgency and mn:
+        # Need another
+        "1. Original approach: x4:digital in q= (should be blocked per API docs but digital processed as kw)",
+        f"mn:{TARGET_MN}",
+        {"catalogSource": "NYINF"},
     ),
     (
-        "2. Your new WorldCat search format: kw:digital + pb: + mn:",
-        f'kw:digital AND pb:(Infobase OR "Films on Demand" OR "Films Media Group")'
+        # OK but picks up non-matching title (use title to choose correctly?)
+        "2. New initial search format: pb: OR au: + mn:",
+        f'(pb:({TARGET_PB}) OR au:{TARGET_AU})'
          f' AND mn:{TARGET_MN}',
-        {},
+        {"itemSubType": "video-digital"},
     ),
     (
-        "3. Simplified: mn: only (verify the standard number finds the record)",
-        f"mn:{TARGET_MN}",
-        {},
+        # Returned only relevant titles - need to be careful with TARGET_SE because null "" returns 0 results
+        # Could use OR to extend title search results ({TARGET_TI} OR {TARGET_SUB_TI})
+        "3. Extended search without mn:",
+        f'ti:({TARGET_TI} {TARGET_SUB_TI}) AND au:{TARGET_AU}{TARGET_SE}',
+        {"itemSubType": "video-digital"},
     ),
     (
+        # Returned some non-related titles
         "4. Correct API format: mn: in q= + itemType/itemSubType as separate params",
-        f"mn:{TARGET_MN}",
-        {"itemType": "video", "itemSubType": "video-digital"},
+        f"mn:{TARGET_MN} AND kw:{TARGET_PB}",
+        {"itemSubType": "video-digital"},
     ),
     (
+        # Returned zero titles
         "5. Publisher + mn: with itemSubType filter (most precise approach)",
-        f'pb:(Infobase OR "Films on Demand" OR "Films Media Group") AND mn:{TARGET_MN}',
-        {"itemType": "video", "itemSubType": "video-digital"},
+        f'mn:{TARGET_MN}',
+        {"itemSubType": "video-digital"},
     ),
     (
-        "6. kw:digital + mn: without pb: (simpler, avoids publisher name variations)",
-        f"kw:digital AND mn:{TARGET_MN}",
-        {},
+        # Same results as search 2 (pb: made no difference)
+        "6. mn: without pb: (simpler, avoids publisher name variations); try au: from 710a",
+        f"au:{TARGET_AU} AND mn:{TARGET_MN}",
+        {"itemSubType": "video-digital"},
     ),
 ]
 
