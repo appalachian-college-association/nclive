@@ -964,6 +964,9 @@ class InfobaseMARCProcessor:
                 updated_df.loc[mask, 'collection_type'] = record['collection_type']
                 updated_df.loc[mask, 'last_updated'] = today
                 updated_df.loc[mask, 'avod_title_id'] = record.get('avod_title_id', '')
+                updated_df.loc[mask, 'corporate_name'] = record.get('corporate_name', '')
+                updated_df.loc[mask, 'series_name'] = record.get('series_name', '')
+                updated_df.loc[mask, 'subtitle'] = record.get('subtitle', '')
                 updates_applied += 1
                 logger.debug("Updated existing record: %s", lookup_id_collection)
             else:
@@ -977,7 +980,10 @@ class InfobaseMARCProcessor:
                     'title': record['title'],
                     'collection_type': record['collection_type'],
                     'last_updated': today,
-                    'avod_title_id': record.get('avod_title_id', '')
+                    'avod_title_id': record.get('avod_title_id', ''),
+                    'corporate_name': record.get('corporate_name', ''),
+                    'series_name': record.get('series_name', ''),
+                    'subtitle': record.get('subtitle', ''),
                 }
                 updated_df = pd.concat(
                     [updated_df, pd.DataFrame([new_record])], ignore_index=True
