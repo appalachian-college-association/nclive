@@ -20,7 +20,7 @@ OCLC_DTYPES = {
     'collection_type': 'str'
 }
 
-class Config:
+class Config:  # pylint: disable=too-many-instance-attributes
     """Configuration management for local environment"""
 
     def __init__(self):
@@ -34,6 +34,10 @@ class Config:
             'URL_REPLACE_CHARS',
             default=['-', '–', '—', '―']
         )
+        # Testing-only AVOD/JFK account IDs for clickable manual-review links.
+        # Blank by default — only set in .env for local testing convenience.
+        self._test_aid = os.getenv('TEST_AID', '')
+        self._test_lid = os.getenv('TEST_LID', '')
         # Load secrets
         self._load_local_secrets()
 
@@ -95,3 +99,15 @@ class Config:
     def restrict_to_library(self) -> bool:
         """True limits API search to default library holdings; False for global search"""
         return self._restrict_to_library
+
+    @property
+    def test_aid(self) -> str:
+        """Testing-only Infobase AVOD account ID for clickable manual-review links.
+        Must NEVER be used in KBART title_id/title_url output."""
+        return self._test_aid
+
+    @property
+    def test_lid(self) -> str:
+        """Testing-only Infobase JFK (old platform) library ID for clickable manual-review links.
+        Must NEVER be used in KBART title_id/title_url output."""
+        return self._test_lid

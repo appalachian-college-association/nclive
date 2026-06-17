@@ -48,6 +48,13 @@ except ImportError:
     DEFAULT_LIBRARY = "ACACL" # Fallback to local holdings
     RESTRICT_TO_LIBRARY = False # Fallback to global search
 
+# TESTING ONLY: institution AID/library ID used to build clickable AVOD/JFK
+# links in the manual review CSV (infobase_link column). Sourced from .env via
+# config.py — never hardcoded here, and never used in KBART title_id/title_url
+# output (those must keep a blank ?aid= placeholder for Collection Manager).
+TEST_AID = config.test_aid if 'config' in dir() else ''
+TEST_LID = config.test_lid if 'config' in dir() else ''
+
 # Setup logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -64,7 +71,7 @@ class ExtendedMARCProcessor:
                  manual_review_output: str = "manual_review_searches.csv"):
         """
         Initialize the extended processor.
-        
+
         Args:
             updated_lookup_file: Path to InfobaseLookup_updated.csv
             manual_review_output: Output file for manual review searches
@@ -95,7 +102,7 @@ class ExtendedMARCProcessor:
     def load_manual_review_items(self) -> List[Dict]:
         """
         Load items marked for manual review from InfobaseLookup_updated.csv.
-        
+
         Returns:
             List of records needing manual review
         """
@@ -145,15 +152,15 @@ class ExtendedMARCProcessor:
     def extract_series_from_title(self, title: str) -> Optional[str]:
         """
         Extract series name from title with parenthetical information.
-        
+
         Examples:
         "Assessment of the Newborn : 2025 Version" -> None (no parenthetical)
         "Title Name (Assessment of the Newborn Series)" -> "Assessment of the Newborn Series"
         "Title (Series: Assessment of the Newborn)" -> "Assessment of the Newborn"
-        
+
         Args:
             title: Full title string
-            
+
         Returns:
             Extracted series name or None
         """
@@ -182,10 +189,10 @@ class ExtendedMARCProcessor:
     def clean_title_for_search(self, title: str) -> str:
         """
         Clean title for OCLC search by removing problematic characters and formatting.
-        
+
         Args:
             title: Original title
-            
+
         Returns:
             Cleaned title suitable for API search
         """
@@ -212,7 +219,7 @@ class ExtendedMARCProcessor:
     def get_token_cached(self) -> str:
         """
         Get OCLC API access token with caching.
-        
+
         Returns:
             Valid access token
         """
@@ -232,19 +239,17 @@ class ExtendedMARCProcessor:
     def search_oclc_by_title(self, title: str, max_results: int = 5) -> List[Dict]:
         """
         Search OCLC Discovery API by title.
-        
+
         Args:
             title: Title to search for
             max_results: Maximum number of results to return
-            
+
         Returns:
             List of matching records
         """
         if not title:
             return []
         try:
-            # token = self.get_token_cached()
-            # Clean and format title for search
             clean_title = self.clean_title_for_search(title)
             if not clean_title:
                 return []
@@ -255,7 +260,7 @@ class ExtendedMARCProcessor:
                 "Accept": "application/json"
             }
             params = {
-                "q": query, 
+                "q": query,
                 "limit": max_results,
                 "itemSubType": "video-digital",
             }
@@ -292,11 +297,11 @@ class ExtendedMARCProcessor:
     def search_oclc_by_series(self, series: str, max_results: int = 3) -> List[Dict]:
         """
         Search OCLC Discovery API by series name.
-        
+
         Args:
             series: Series name to search for
             max_results: Maximum number of results to return
-            
+
         Returns:
             List of matching records
         """
@@ -304,8 +309,6 @@ class ExtendedMARCProcessor:
             return []
 
         try:
-            token = self.get_token_cached()
-
             # Search both title field and series field for the series name
             queries = [
                 f'se:"{series}"',   # Series field (MARC 830)
@@ -316,11 +319,11 @@ class ExtendedMARCProcessor:
 
             for query in queries:
                 headers = {
-                    "Authorization": f"Bearer {token}",
+                    "Authorization": f"Bearer {self.get_token_cached()}",
                     "Accept": "application/json"
                 }
                 params = {
-                    "q": query, 
+                    "q": query,
                     "limit": max_results,
                     "itemSubType": "video-digital",
                 }
@@ -364,11 +367,12 @@ class ExtendedMARCProcessor:
             self.stats['api_errors'] += 1
             return []
 
+
     def search_oclc_by_infobase_id(self, lookup_id: str, max_results: int = 5) -> List[Dict]:
         """
         Search OCLC Discovery API using the main.py query format without kw:Infobase.
         This mimics the main.py search but removes the Infobase keyword constraint.
-        
+
         IMPORTANT: Only searches on xtid values, NOT customid values.
         customid values don't correspond to MARC 028 fields and cause bad matches.
 
@@ -384,9 +388,6 @@ class ExtendedMARCProcessor:
             return []
 
         try:
-            # token = self.get_token_cached()
-            # replaced in f-string for Authorization header (DELETE after testing)
-
             # Extract numeric ID from lookup_id format
             # ONLY search on xtid values - these correspond to MARC 028 fields
             xtid_match = re.search(r'xtid=(.+)\$', lookup_id)
@@ -406,9 +407,15 @@ class ExtendedMARCProcessor:
 
             numeric_id = xtid_match.group(1)
 
-            # Build query using mn: (MARC 028$a / publisher number) — correct index
-            # pb: limit results and rely on fallbacks for missed matches
+
             # itemSubType=video-digital is passed as a separate URL parameter (not in q=)
+            query = f'mn:{numeric_id} AND pb:Infobase'
+
+            # Build query using mn: (MARC 028$a / publisher number) — correct index
+            # pb:Infobase tested against kw:(Infobase OR "Access Video" OR Films) on 8
+            # manual-review records (see test_pb_vs_kw_anchor.py, 2026-06-17) — identical
+            # results on every test case, no matches missed by the narrower form.
+            # # itemSubType=video-digital is passed as a separate URL parameter (not in q=)
             query = f'mn:{numeric_id} AND pb:Infobase'
 
             headers = {
@@ -454,10 +461,262 @@ class ExtendedMARCProcessor:
             self.stats['api_errors'] += 1
             return []
 
+
+    def search_oclc_by_corporate_name(
+        self, corporate_name: str, title: str, max_results: int = 5
+    ) -> List[Dict]:
+        """
+        Search OCLC by corporate name (au:) combined with title (ti:).
+
+        Used when mn: search is unavailable or returned no results.
+        Combines au: (from MARC 710$a) with ti: (from MARC 245$a) for precision.
+
+        Args:
+            corporate_name: Cleaned 710$a value (e.g. 'Digital Classics')
+            title:          Title string from MARC 245$a for ti: search
+            max_results:    Maximum number of results to return
+
+        Returns:
+            List of matching record dicts
+        """
+        if not corporate_name:
+            return []
+
+        try:
+            clean_title = self.clean_title_for_search(title)
+
+            # Build query: au: alone if no clean title; combined if both present
+            if clean_title:
+                query = f'au:"{corporate_name}" AND ti:"{clean_title}"'
+            else:
+                query = f'au:"{corporate_name}"'
+
+            headers = {
+                "Authorization": f"Bearer {self.get_token_cached()}",
+                "Accept": "application/json"
+            }
+            params = {
+                "q": query,
+                "limit": max_results,
+                "itemSubType": "video-digital",
+            }
+
+            if RESTRICT_TO_LIBRARY:
+                params["heldByLibrary"] = DEFAULT_LIBRARY
+
+            logger.info("Searching OCLC by corporate name: %s", query)
+            response = requests.get(API_URL, headers=headers, params=params, timeout=(10,30))
+            response.raise_for_status()
+
+            data = response.json()
+            records = data.get("briefRecords", [])
+
+            video_records = []
+            for record in records:
+                if (record.get("generalFormat") == "Video" and
+                        record.get("specificFormat") == "Digital"):
+                    video_records.append({
+                        'oclc_number': record.get("oclcNumber", ""),
+                        'title': record.get("title", ""),
+                        'general_format': record.get("generalFormat", ""),
+                        'specific_format': record.get("specificFormat", ""),
+                        'search_type': 'corporate_name_search',
+                    })
+
+            return video_records
+
+        except requests.exceptions.RequestException as e:
+            logger.error("Error searching by corporate name '%s': %s", corporate_name, e)
+            self.stats['api_errors'] += 1
+            return []
+
+    # --- Private helpers to reduce complexity in large methods ---
+
+    def _get_recommended_action(
+        self,
+        infobase_id_matches: list,
+        corporate_name_matches: list,
+        title_matches: list,
+        series_matches: list
+    ) -> str:
+        """Return the highest-priority recommended action string."""
+        if infobase_id_matches:
+            return 'INFOBASE_ID_MATCH'
+        if corporate_name_matches:
+            return 'CORPORATE_NAME_MATCH'
+        if title_matches:
+            return 'TITLE_MATCH'
+        if series_matches:
+            return 'SERIES_MATCH'
+        return 'NO_MATCH'
+
+    def _build_infobase_link(
+        self, lookup_id: str, collection_type: str, avod_title_id: str = ''
+    ) -> str:
+        """Construct a browse link to the Infobase record.
+
+        FOD is fully migrated to AVOD (access.infobase.com); JFK remains on the
+        legacy platform until its own migration occurs.
+        """
+        if collection_type == 'fod' and avod_title_id:
+            # avod_title_id is stored as e.g. "video/7384"
+            return f"https://access.infobase.com/{avod_title_id}?aid={TEST_AID}"
+        if not lookup_id:
+            return ""
+        clean_id = lookup_id.rstrip('$')
+        if collection_type == 'jfk':
+            return f"https://jfk.infobase.com/PortalPlaylists.aspx?{clean_id}&wID={TEST_LID}"
+        # Default: legacy FOD URL (FOD records without avod_title_id yet, or unknown type)
+        return f"https://fod.infobase.com/PortalPlaylists.aspx?{clean_id}&wID={TEST_LID}"
+
+    def _build_match_record(self, base_record: dict, result: dict) -> dict:
+        """Build a single flattened match record for CSV output."""
+        record = base_record.copy()
+        if result['infobase_id_matches']:
+            match = result['infobase_id_matches'][0]
+            record.update({
+                'match_type': 'INFOBASE_ID_MATCH',
+                'match_rank': 1,
+                'suggested_oclc': match['oclc_number'],
+                'suggested_title': self.clean_text_for_export(match['title']),
+                'match_format': f"{match['general_format']}-{match['specific_format']}",
+                'manual_review_notes': 'First infobase ID match',
+                'verifiedOCN': '',
+                'accept_suggestion': ''
+            })
+        elif result.get('corporate_name_matches'):
+            match = result['corporate_name_matches'][0]
+            record.update({
+                'match_type': 'CORPORATE_NAME_MATCH',
+                'match_rank': 1,
+                'suggested_oclc': match['oclc_number'],
+                'suggested_title': self.clean_text_for_export(match['title']),
+                'match_format': f"{match['general_format']}-{match['specific_format']}",
+                'manual_review_notes': 'Corporate name + title match (710$a + 245$a)',
+                'verifiedOCN': '',
+                'accept_suggestion': ''
+            })
+        elif result['title_matches']:
+            match = result['title_matches'][0]
+            record.update({
+                'match_type': 'TITLE_MATCH',
+                'match_rank': 1,
+                'suggested_oclc': match['oclc_number'],
+                'suggested_title': self.clean_text_for_export(match['title']),
+                'match_format': f"{match['general_format']}-{match['specific_format']}",
+                'manual_review_notes': 'First title match',
+                'verifiedOCN': '',
+                'accept_suggestion': ''
+            })
+        elif result['series_matches']:
+            match = result['series_matches'][0]
+            record.update({
+                'match_type': 'SERIES_MATCH',
+                'match_rank': 1,
+                'suggested_oclc': match['oclc_number'],
+                'suggested_title': match['title'],
+                'match_format': f"{match['general_format']}-{match['specific_format']}",
+                'manual_review_notes': (
+                    f'Series-level match for: {result.get("extracted_series", "")}'
+                ),
+                'verifiedOCN': '',
+                'accept_suggestion': ''
+            })
+        else:
+            record.update({
+                'match_type': 'NO_MATCH',
+                'match_rank': 0,
+                'suggested_oclc': '',
+                'suggested_title': '',
+                'match_format': '',
+                'manual_review_notes': 'No matches found',
+                'verifiedOCN': '',
+                'accept_suggestion': ''
+            })
+        return record
+
+    def _get_update_source(self, match_type: str) -> str:
+        """Map match_type to a source label for lookup updates."""
+        source_map = {
+            'INFOBASE_ID_MATCH': 'API_INFOBASE_ID',
+            'TITLE_MATCH': 'API_EXT_TITLE',
+            'SERIES_MATCH': 'API_EXT_SERIES',
+            'NO_MATCH': 'MANUAL_ENTRY',
+        }
+        return source_map.get(match_type, 'API_EXT_SEARCH')
+
+    def _collect_accepted_updates(self, reviewed_df: pd.DataFrame) -> dict:
+        """Extract accepted OCN updates from a manually reviewed DataFrame."""
+        accepted_updates = {}
+        for _, row in reviewed_df.iterrows():
+            accept_suggestion = str(row.get('accept_suggestion', '')).strip().lower()
+            lookup_id = row.get('original_lookup_id', '')
+            collection_type = row.get('collection_type', '')
+            match_type = row.get('match_type', '')
+
+            oclc_number = None
+            if accept_suggestion in ['yes', 'y', '1', 'true']:
+                suggested_oclc = str(row.get('suggested_oclc', '')).strip()
+                if suggested_oclc and suggested_oclc.lower() not in ['', 'nan', 'null']:
+                    oclc_number = suggested_oclc
+
+            if not oclc_number:
+                verified_ocn = str(row.get('verifiedOCN', '')).strip()
+                if verified_ocn and verified_ocn.lower() not in ['', 'nan', 'null']:
+                    oclc_number = verified_ocn
+                    accept_suggestion = 'yes'
+
+            if lookup_id and oclc_number and accept_suggestion in ['yes', 'y', '1', 'true']:
+                lookup_id_collection = f"{lookup_id}{collection_type}"
+                source = self._get_update_source(match_type)
+                accepted_updates[lookup_id_collection] = {
+                    'verifiedOCN': oclc_number,
+                    'source': source,
+                    'base_lookup_id': lookup_id
+                }
+                logger.info("Accepted update for %s: %s (source: %s)",
+                            lookup_id_collection, oclc_number, source)
+        return accepted_updates
+
+    def _apply_updates_to_df(self, updated_df: pd.DataFrame, accepted_updates: dict) -> None:
+        """Apply accepted OCN updates to the lookup DataFrame in place."""
+        today = datetime.now().strftime('%Y-%m-%d')
+        for lookup_id_collection, updates in accepted_updates.items():
+            mask = updated_df['lookupIDcollection'] == lookup_id_collection
+            if mask.any():
+                updated_df.loc[mask, 'verifiedOCN'] = updates['verifiedOCN']
+                updated_df.loc[mask, 'source'] = updates['source']
+                updated_df.loc[mask, 'last_updated'] = today
+                logger.info("Updated %s with OCLC %s",
+                            lookup_id_collection, updates['verifiedOCN'])
+                continue
+            # Fallback: match on base lookupID alone
+            base_lookup_id = updates['base_lookup_id']
+            mask_fallback = updated_df['lookupID'] == base_lookup_id
+            if not mask_fallback.any():
+                logger.warning("Could not find lookup_id %s or %s in original data",
+                               lookup_id_collection, base_lookup_id)
+                continue
+            if mask_fallback.sum() > 1:
+                logger.warning(
+                    "Multiple matches found for %s. Manual review may be needed.",
+                    base_lookup_id
+                )
+                logger.warning("Matches found: %s",
+                               updated_df[mask_fallback]['lookupIDcollection'].tolist())
+                logger.warning("Applied update to all %s matches for %s",
+                               mask_fallback.sum(), base_lookup_id)
+            else:
+                logger.info("Updated %s (fallback match) with OCLC %s",
+                            base_lookup_id, updates['verifiedOCN'])
+            updated_df.loc[mask_fallback, 'verifiedOCN'] = updates['verifiedOCN']
+            updated_df.loc[mask_fallback, 'source'] = updates['source']
+            updated_df.loc[mask_fallback, 'last_updated'] = today
+
     def perform_extended_searches(self) -> List[Dict]:
         """
         Perform extended OCLC searches on all manual review items.
-        
+
         Returns:
             List of extended search results
         """
@@ -478,58 +737,69 @@ class ExtendedMARCProcessor:
             title = record.get('title', '')
             lookup_id = record.get('lookupID', '')
             collection_type = record.get('collection_type', '')
+            corporate_name = record.get('corporate_name', '')   # From MARC 710$a
+            series_name = record.get('series_name', '')         # From MARC 830$a
+            avod_title_id = record.get('avod_title_id', '')     # From MARC 856$u (AVOD path)
 
-            # Extract series from title if present
-            series_name = self.extract_series_from_title(title)
+            # Fall back to regex extraction only if series_name is empty
+            if not series_name:
+                series_name = self.extract_series_from_title(title)
+
             search_result = {
                 'original_lookup_id': lookup_id,
                 'original_title': title,
                 'collection_type': collection_type,
                 'extracted_series': series_name,
+                'avod_title_id': avod_title_id,
                 'title_matches': [],
                 'series_matches': [],
                 'infobase_id_matches': [],
+                'corporate_name_matches': [],
                 'recommended_action': 'NO_MATCH'
             }
 
-            # 1. Search by infobase ID (main.py query without kw:Infobase)
+            # 1. Search by infobase ID (mn: + pb: publisher anchor)
             infobase_id_matches = self.search_oclc_by_infobase_id(lookup_id)
             search_result['infobase_id_matches'] = infobase_id_matches
-
             if infobase_id_matches:
                 self.stats['infobase_id_matches_found'] += 1
-                search_result['recommended_action'] = 'INFOBASE_ID_MATCH'
                 logger.info("  Found %s infobase id matches", len(infobase_id_matches))
 
-            # 2. Search by title
+            # 2. Search by corporate name (au: + ti:) if corporate_name available
+            corporate_name_matches = []
+            if corporate_name:
+                corporate_name_matches = self.search_oclc_by_corporate_name(corporate_name, title)
+                search_result['corporate_name_matches'] = corporate_name_matches
+                if corporate_name_matches:
+                    self.stats['corporate_name_matches_found'] += 1
+                    logger.info("  Found %s corporate name matches", len(corporate_name_matches))
+
+            # 3. Search by title
             title_matches = self.search_oclc_by_title(title)
             search_result['title_matches'] = title_matches
-
             if title_matches:
                 self.stats['title_matches_found'] += 1
-                if not infobase_id_matches:    # Only recommend title if no ID match
-                    search_result['recommended_action'] = 'TITLE_MATCH'
                 logger.info("  Found %s title matches", len(title_matches))
 
-            # 3. Search by series (if extracted)
+            # 4. Search by series (if available)
             series_matches = []
             if series_name:
                 series_matches = self.search_oclc_by_series(series_name)
                 search_result['series_matches'] = series_matches
-
                 if series_matches:
                     self.stats['series_matches_found'] += 1
-                    # Only recommend series if no id or title match
-                    if not infobase_id_matches and not title_matches:
-                        search_result['recommended_action'] = 'SERIES_MATCH'
                     logger.info(
                         "  Found %s series matches for '%s'", len(series_matches), series_name
                         )
 
-            # Track no matches
-            if not infobase_id_matches and not title_matches and not series_matches:
+            if not any([infobase_id_matches, corporate_name_matches,
+                        title_matches, series_matches]):
                 self.stats['no_matches_found'] += 1
                 logger.info("  No matches found")
+
+            search_result['recommended_action'] = self._get_recommended_action(
+                infobase_id_matches, corporate_name_matches, title_matches, series_matches
+            )
 
             results.append(search_result)
 
@@ -542,10 +812,10 @@ class ExtendedMARCProcessor:
     def create_manual_review_file(self, output_file: str = None) -> str:
         """
         Create manual review file with extended search results.
-        
+
         Args:
             output_file: Output file path (optional)
-            
+
         Returns:
             Path to created file
         """
@@ -554,107 +824,21 @@ class ExtendedMARCProcessor:
 
         logger.info("Creating manual review file: %s", output_file)
 
-        # Flatten results for CSV output
         csv_records = []
-
         for result in self.extended_search_results:
-            # Extract lookup_id and build infobase link
-            lookup_id = result['original_lookup_id']  # e.g., "xtid=296504$"
-            collection_type = result['collection_type']  # e.g., "fod" or "jfk"
-
-            # Build infobase link
-            infobase_link = ""
-            if lookup_id:
-                # Remove the "$" from the end
-                clean_lookup_id = lookup_id.rstrip('$')  # "xtid=296504$ becomes "xtid=296504"
-
-                # Build URL based on collection type
-                if collection_type == 'fod':
-                    infobase_link = (
-                        f"https://fod.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"
-                    )
-                elif collection_type == 'jfk':
-                    infobase_link = (
-                        f"https://jfk.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"
-                    )
-                else:
-                    # default to FOD
-                    infobase_link = (
-                        f"https://fod.infobase.com/PortalPlaylists.aspx?{clean_lookup_id}"
-                    )
-
+            lookup_id = result['original_lookup_id']
+            collection_type = result['collection_type']
             base_record = {
-                'original_lookup_id': result['original_lookup_id'],
+                'original_lookup_id': lookup_id,
                 'original_title': result['original_title'],
-                'collection_type': result['collection_type'],
+                'collection_type': collection_type,
                 'extracted_series': result.get('extracted_series', ''),
                 'recommended_action': result['recommended_action'],
-                'infobase_link': infobase_link  # Add the constructed link here
+                'infobase_link': self._build_infobase_link(
+                    lookup_id, collection_type, result.get('avod_title_id', '')
+                )
             }
-
-            # Priority logic: only add the FIRST match from best match typle
-            # Add Infobase ID matches
-            if result['infobase_id_matches']:
-                match = result['infobase_id_matches'][0]
-                record = base_record.copy()
-                record.update({
-                    'match_type': 'INFOBASE_ID_MATCH',
-                    'match_rank': 1,
-                    'suggested_oclc': match['oclc_number'],
-                    'suggested_title': self.clean_text_for_export(match['title']),
-                    'match_format': f"{match['general_format']}-{match['specific_format']}",
-                    'manual_review_notes': 'First infobase ID match',
-                    'verifiedOCN': '',  # To be filled in manually
-                    'accept_suggestion': ''  # To be filled in manually
-                })
-                csv_records.append(record)
-
-            elif result['title_matches']:
-                match = result['title_matches'][0]
-                record = base_record.copy()
-                record.update({
-                    'match_type': 'TITLE_MATCH',
-                    'match_rank': 1,
-                    'suggested_oclc': match['oclc_number'],
-                    'suggested_title': self.clean_text_for_export(match['title']),
-                    'match_format': f"{match['general_format']}-{match['specific_format']}",
-                    'manual_review_notes': 'First title match',
-                    'verifiedOCN': '',  # To be filled in manually
-                    'accept_suggestion': ''  # To be filled in manually
-                })
-                csv_records.append(record)
-
-            # Add series matches
-            elif result['series_matches']:
-                match = result['series_matches'][0]
-                record = base_record.copy()
-                record.update({
-                    'match_type': 'SERIES_MATCH',
-                    'match_rank': 1,
-                    'suggested_oclc': match['oclc_number'],
-                    'suggested_title': match['title'],
-                    'match_format': f"{match['general_format']}-{match['specific_format']}",
-                    'manual_review_notes': f'Series-level match for: '
-                    f'{result.get("extracted_series", "")}',
-                    'verifiedOCN': '',  # To be filled in manually
-                    'accept_suggestion': ''  # To be filled in manually
-                })
-                csv_records.append(record)
-
-            # Add no-match record
-            else:
-                record = base_record.copy()
-                record.update({
-                    'match_type': 'NO_MATCH',
-                    'match_rank': 0,
-                    'suggested_oclc': '',
-                    'suggested_title': '',
-                    'match_format': '',
-                    'manual_review_notes': 'No matches found',
-                    'verifiedOCN': '',  # To be filled in manually
-                    'accept_suggestion': ''  # To be filled in manually
-                })
-                csv_records.append(record)
+            csv_records.append(self._build_match_record(base_record, result))
 
         # Write CSV
         with open(output_file, 'w', newline='', encoding='utf-8') as file:
@@ -682,11 +866,11 @@ class ExtendedMARCProcessor:
         """
         Process manually reviewed file and update lookup data.
         FIXED VERSION - Handles duplicate title IDs correctly using lookupIDcollection.
-        
+
         Args:
             reviewed_file: Path to manually reviewed CSV file
             updated_lookup_output: Output path for final lookup file
-            
+
         Returns:
             Path to updated lookup file
         """
@@ -708,123 +892,19 @@ class ExtendedMARCProcessor:
             logger.error("Could not load original lookup file: %s", e)
             return None
 
-        # Process accepted suggestions
-        accepted_updates = {}
-
-        for _, row in reviewed_df.iterrows():
-            accept_suggestion = str(row.get('accept_suggestion', '')).strip().lower()
-            lookup_id = row.get('original_lookup_id', '')
-            collection_type = row.get('collection_type', '')  # This tells us fod or jfk
-            match_type = row.get('match_type', '')
-
-            # Get OCLC number from either suggested_oclc OR verifiedOCN
-            oclc_number = None
-
-            # First priority: Check for accept_suggestion is 'yes' and exist suggested_oclc
-            if accept_suggestion in ['yes', 'y', '1', 'true']:
-                suggested_oclc = str(row.get('suggested_oclc', '')).strip()
-                if suggested_oclc and suggested_oclc.lower() not in ['', 'nan', 'null']:
-                    oclc_number = suggested_oclc
-
-            # Second priority: Check if we have a manually entered verifiedOCN
-            if not oclc_number:
-                verified_ocn = str(row.get('verifiedOCN', '')).strip()
-                if verified_ocn and verified_ocn.lower() not in ['', 'nan', 'null']:
-                    oclc_number = verified_ocn
-                    # Automatically set accept_suggestion to yes if we have a manual verifiedOCN
-                    accept_suggestion = 'yes'
-
-            # Only process if we have both lookup_id and a valid OCLC number
-            if lookup_id and oclc_number and accept_suggestion in ['yes', 'y', '1', 'true']:
-                # FIXED: Create the full lookupIDcollection for proper matching
-                lookup_id_collection = f"{lookup_id}{collection_type}"
-
-                # Determine source label
-                if match_type == "INFOBASE_ID_MATCH":
-                    source = 'API_INFOBASE_ID'
-                elif match_type == 'TITLE_MATCH':
-                    source = 'API_EXT_TITLE'
-                elif match_type == 'SERIES_MATCH':
-                    source = 'API_EXT_SERIES'
-                elif match_type == 'NO_MATCH':
-                    source = 'MANUAL_ENTRY'  # For manually entered OCLC numbers
-                else:
-                    source = 'API_EXT_SEARCH'
-
-                # FIXED: Use lookupIDcollection as the key instead of just lookupID
-                accepted_updates[lookup_id_collection] = {
-                    'verifiedOCN': oclc_number,
-                    'source': source,
-                    'base_lookup_id': lookup_id  # Keep base ID for logging
-                }
-
-                logger.info(
-                    "Accepted update for %s,: %s (source: %s)",
-                    lookup_id_collection, oclc_number, source
-                )
-
+        accepted_updates = self._collect_accepted_updates(reviewed_df)
         logger.info("Processing %s accepted updates", len(accepted_updates))
 
-        # Update original lookup data
         updated_df = original_df.copy()
-
-        # FIXED: Use lookupIDcollection for matching instead of lookupID
-        for lookup_id_collection, updates in accepted_updates.items():
-            mask = updated_df['lookupIDcollection'] == lookup_id_collection
-            if mask.any():
-                updated_df.loc[mask, 'verifiedOCN'] = updates['verifiedOCN']
-                updated_df.loc[mask, 'source'] = updates['source']
-                updated_df.loc[mask, 'last_updated'] = datetime.now().strftime('%Y-%m-%d')
-                logger.info("Updated %s with OCLC %s",
-                            lookup_id_collection, updates['verifiedOCN']
-                            )
-            else:
-                # Try fallback to base lookupID matching (for backwards compatibility)
-                base_lookup_id = updates['base_lookup_id']
-                mask_fallback = updated_df['lookupID'] == base_lookup_id
-                if mask_fallback.any():
-                    # If multiple matches (duplicate title IDs), warn user
-                    if mask_fallback.sum() > 1:
-                        logger.warning("Multiple matches found for %s."
-                                       "Manual review may be needed.",
-                                       {base_lookup_id}
-                                       )
-                        logger.warning(
-                            "Matches found: %s",
-                            {updated_df[mask_fallback]['lookupIDcollection'].tolist()}
-                            )
-                        # Apply update to all matches (may not be ideal, but prevents data loss)
-                        updated_df.loc[mask_fallback, 'verifiedOCN'] = updates['verifiedOCN']
-                        updated_df.loc[mask_fallback, 'source'] = updates['source']
-                        updated_df.loc[mask_fallback, 'last_updated'] = datetime.now().strftime(
-                            '%Y-%m-%d')
-                        logger.warning(
-                            "Applied update to all %s matches for %s",
-                            mask_fallback.sum(),base_lookup_id
-                            )
-                    else:
-                        # Single match - safe to update
-                        updated_df.loc[mask_fallback, 'verifiedOCN'] = updates['verifiedOCN']
-                        updated_df.loc[mask_fallback, 'source'] = updates['source']
-                        updated_df.loc[mask_fallback, 'last_updated'] = datetime.now().strftime(
-                            '%Y-%m-%d'
-                            )
-                        logger.info("Updated %s (fallback match) with OCLC %s",
-                                    base_lookup_id, updates['verifiedOCN']
-                                    )
-                else:
-                    logger.warning(
-                        "Could not find lookup_id %s or %s in original data",
-                        lookup_id_collection, base_lookup_id
-                        )
+        self._apply_updates_to_df(updated_df, accepted_updates)
 
         # DIAGNOSTIC: Check for any remaining "X" values
         remaining_x_count = len(updated_df[updated_df['verifiedOCN'] == 'X'])
         if remaining_x_count > 0:
             logger.info(
                 "After manual review processing: %s items still marked for manual review ('X')",
-                {remaining_x_count}
-                )
+                remaining_x_count
+            )
         else:
             logger.info("All manual review items have been processed - no 'X' values remaining")
 
@@ -837,10 +917,10 @@ class ExtendedMARCProcessor:
     def generate_statistics_report(self, output_file: str = "extended_search_stats.txt") -> str:
         """
         Generate detailed statistics report with FOD/JFK breakdown.
-        
+
         Args:
             output_file: Output file for statistics report
-            
+
         Returns:
             Path to statistics report
         """
@@ -944,6 +1024,7 @@ def main():
 
     # Perform extended searches
     print(f"\nPerforming extended OCLC searches on {len(manual_review_items)} items...")
+    processor.perform_extended_searches()
 
     # Create manual review file
     manual_review_file = processor.create_manual_review_file()
@@ -986,10 +1067,10 @@ def process_updates_main():
 
     if updated_lookup:
         print("\n Processing complete!")
-        print("Updated lookup file: {updated_lookup}")
+        print(f"Updated lookup file: {updated_lookup}")
         print("\n Final Steps:")
         print("1. Run: python kbart_integration.py")
-        print("   This will create the final KBART files using {updated_lookup}")
+        print(f"   This will create the final KBART files using {updated_lookup}")
         print("2. Run: python final_kbart_integration_reporting.py")
         print("   For comprehensive reporting and validation")
     else:
