@@ -45,6 +45,11 @@ collection_diagnostic.py
 marc_debug_856z.py
 test_query_formats.py
 CLAUDE.md
+main_replaced.py
+test_pb_vs_kw_anchor.py
+test_load.py
+test_mn_ground_truth_v3.py
+test_query_formats_v2.py
 
 # Directories
 kbart_files/
