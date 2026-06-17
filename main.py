@@ -18,6 +18,7 @@ import os
 import sys
 import logging
 import time
+from typing import Optional
 from dotenv import load_dotenv
 import requests
 from auth import OCLCAuth
@@ -64,17 +65,24 @@ def load_search_terms(filename):
       4: mn-review-flag        ('Y' if 028 absent, 'N' otherwise)
       5: au-review-flag        ('Y' if no qualifying 710, 'N' otherwise)
 
+    Uses csv.reader with settings matching the csv.writer in
+    marc_processor.py's generate_search_terms() (delimiter, quoting,
+    escapechar) so embedded quote characters in au-fragment/se-fragment
+    are decoded the same way they were encoded, rather than read as
+    literal text.
+
     Returns a list of dicts, one per TSV row.
     """
     terms = []
     try:
-        with open(filename, "r", encoding="utf-8") as file:
-            next(file)  # Skip header row
-            for line in file:
-                line = line.strip()
-                if not line:
+        with open(filename, "r", newline='', encoding="utf-8") as file:
+            reader = csv.reader(
+                file, delimiter='\t', quoting=csv.QUOTE_NONE, escapechar='\\'
+            )
+            next(reader)  # Skip header row
+            for parts in reader:
+                if not parts:
                     continue
-                parts = line.split('\t')
                 if len(parts) >= 2:
                     terms.append({
                         'lookup_id':    parts[0].strip(),
@@ -85,7 +93,7 @@ def load_search_terms(filename):
                         'au_flag':      parts[5].strip() if len(parts) > 5 else 'N',
                     })
         logger.info("Loaded %s search terms from %s", len(terms), filename)
-    except (OSError, StopIteration) as e:
+    except (OSError, StopIteration, csv.Error) as e:
         logger.error("Error loading search terms: %s", e)
     return terms
 
@@ -93,19 +101,30 @@ def load_search_terms(filename):
 # -------------------------------
 # 3. Submit query to the API and fetch results
 # -------------------------------
-def run_search(query, token, item_subtype, restrict_to_library=RESTRICT_TO_LIBRARY):
+def run_search(query, item_subtype, restrict_to_library=RESTRICT_TO_LIBRARY):
     """
     Run one search against the OCLC Discovery API.
 
     Args:
         query:               The q= string (e.g. 'mn:10032 AND au:"Digital Classics"')
-        token:               Valid Bearer token
         item_subtype:        itemSubType URL parameter value (e.g. 'video-digital')
         restrict_to_library: If True, adds heldByLibrary filter
 
     Returns:
         Parsed JSON response dict
+
+    Note:
+        Calls auth_handler.get_valid_token() on every invocation rather than
+        accepting a token passed in from the caller. get_valid_token() checks
+        the cached token's expiry (auth.py's _is_token_valid()) and only
+        requests a fresh one when needed, so this is cheap when the token is
+        still good - but it guarantees a long-running loop (e.g. 1,944
+        records) never keeps using a token that has since expired.
     """
+    token = auth_handler.get_valid_token()
+    if not token:
+        raise RuntimeError("Failed to retrieve a valid OCLC access token")
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json"
@@ -212,6 +231,32 @@ def write_skipped_to_csv(output_file, lookup_id, skip_reason):
 # -------------------------------
 # 5. Run the script
 # -------------------------------
+def _load_completed_lookup_ids(output_file: str) -> set:
+    """
+    Read lookupID values already present in an existing oclc_results.csv.
+
+    Used by --resume to skip records that were already searched (matched,
+    skipped, or errored) in a previous run. A lookup_id can appear on
+    multiple rows (one per matched briefRecord), so this returns a set of
+    unique IDs rather than a row count.
+
+    Returns an empty set if the file doesn't exist or can't be read.
+    """
+    completed = set()
+    if not os.path.exists(output_file):
+        return completed
+    try:
+        with open(output_file, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header row, if present
+            for row in reader:
+                if row:
+                    completed.add(row[0].strip())
+    except (OSError, csv.Error) as e:
+        logger.error("Could not read existing %s for resume: %s", output_file, e)
+    return completed
+
+
 def _remove_existing_output(output_file: str) -> None:
     """Delete a stale oclc_results.csv so each run starts from a clean slate."""
     if os.path.exists(output_file):
@@ -250,7 +295,7 @@ def _write_csv_header(output_file: str) -> None:
             "skip_reason",    # why a record was not searched (empty if searched)
         ])
 
-def _search_with_subtypes(term: dict, token: str, output_file: str) -> tuple[int, str | None]:
+def _search_with_subtypes(term: dict, output_file: str) -> tuple[int, str | None]:
     """
     Try each itemSubType in ITEM_SUBTYPES_FALLBACK until results are found.
 
@@ -259,12 +304,12 @@ def _search_with_subtypes(term: dict, token: str, output_file: str) -> tuple[int
     all subtypes returned 0 results.
     """
     lookup_id = term['lookup_id']
-    query = f"{term['search_query']}{term['au_fragment']}"
+    query = f"{term['search_query']} {term['au_fragment']}"
     matched_subtype = None
     records_written = 0
 
     for subtype in ITEM_SUBTYPES_FALLBACK:
-        data = run_search(query, token, subtype, restrict_to_library=RESTRICT_TO_LIBRARY)
+        data = run_search(query, subtype, restrict_to_library=RESTRICT_TO_LIBRARY)
         result_count = len(data.get("briefRecords", []))
         print(f"  itemSubType={subtype}: {result_count} result(s)")
 
@@ -278,16 +323,115 @@ def _search_with_subtypes(term: dict, token: str, output_file: str) -> tuple[int
     return records_written, matched_subtype
 
 
-def _verify_row_count(output_file: str, expected_count: int) -> None:
-    """Check that the CSV row count matches expected_count (header not included)."""
+def _verify_row_count(output_file: str, expected_count: int, baseline_ids: set = None) -> None:
+    """
+    Check that the CSV row count matches expected_count (header not included).
+
+    Args:
+        output_file:    Path to oclc_results.csv
+        expected_count: Number of rows expected to have been added this run
+        baseline_ids:   If resuming, the set of lookup_ids already present
+                         before this run started (from _load_completed_lookup_ids).
+                         When provided, only rows whose lookupID is NOT in this
+                         set are counted as "new", so pre-existing rows from an
+                         earlier session aren't mistaken for this run's output.
+    """
     try:
-        with open(output_file, 'r', encoding='utf-8') as f:
-            row_count = sum(1 for _ in csv.reader(f)) - 1
-            print(f"  Verified:  {row_count} data rows in CSV")
+        with open(output_file, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header
+            if baseline_ids is None:
+                row_count = sum(1 for _ in reader)
+            else:
+                row_count = sum(1 for row in reader if row and row[0].strip() not in baseline_ids)
+            print(f"  Verified:  {row_count} new data rows in CSV")
             if row_count != expected_count:
-                print(f"  Warning: expected {expected_count} rows but found {row_count}")
+                print(f"  Warning: expected {expected_count} new rows but found {row_count}")
     except OSError as e:
         print(f"Error verifying CSV: {e}")
+
+
+def _prepare_for_run(resume: bool, output_file: str) -> tuple[Optional[list], set]:
+    """
+    Handle all setup before the main search loop runs.
+
+    For a fresh run: deletes any stale output file, verifies credentials,
+    loads search_terms.tsv, and writes the CSV header.
+
+    For a resumed run: loads already-completed lookup_ids from the existing
+    output file, verifies credentials, loads search_terms.tsv, and filters
+    out records that are already done. The CSV header is NOT rewritten,
+    since the existing file already has one.
+
+    Returns:
+        (search_terms, already_completed)
+        search_terms is None if there's nothing to process (load failure,
+        empty file, or - in resume mode - everything already completed).
+        Callers should check for this and exit/return without proceeding.
+    """
+    already_completed: set = set()
+
+    if resume:
+        print(f"Resume mode: will skip records already present in {output_file}")
+        already_completed = _load_completed_lookup_ids(output_file)
+        print(f"  Found {len(already_completed)} already-completed lookup_ids")
+    else:
+        _remove_existing_output(output_file)
+
+    print("Verifying OCLC credentials...")
+    if not auth_handler.get_valid_token():
+        print("Failed to retrieve access token. Check your credentials.")
+        return None, already_completed
+
+    print("Loading search terms...")
+    search_terms = load_search_terms("search_terms.tsv")
+
+    if not search_terms:
+        print("No search terms found or could not parse the file.")
+        return None, already_completed
+
+    if resume:
+        original_count = len(search_terms)
+        search_terms = [
+            t for t in search_terms if t['lookup_id'] not in already_completed
+        ]
+        print(f"  {original_count - len(search_terms)} records already completed, "
+              f"{len(search_terms)} remaining to process")
+        if not search_terms:
+            print("Nothing left to process - all records already completed.")
+            return None, already_completed
+    else:
+        print(f"Found {len(search_terms)} search terms to process.")
+        _write_csv_header(output_file)
+
+    return search_terms, already_completed
+
+
+# pylint: disable=too-many-arguments,too-many-positional-arguments
+def _print_run_summary(
+    resume: bool,
+    search_terms: list,
+    skipped_count: int,
+    total_records: int,
+    already_completed: set,
+    output_file: str,
+) -> None:
+    """Print the final 'Done!' summary and run the row-count verification check."""
+    print("\nDone!")
+    if resume:
+        print(f"  This session — Searched: {len(search_terms) - skipped_count} records, "
+              f"Skipped: {skipped_count} records, API rows: {total_records}")
+        print(f"  Combined with {len(already_completed)} previously completed records, "
+              f"see {output_file} for the full result set.")
+        expected_new_rows = total_records + skipped_count
+        _verify_row_count(
+            output_file, expected_new_rows, baseline_ids=already_completed
+        )
+    else:
+        print(f"  Searched:  {len(search_terms) - skipped_count} records")
+        print(f"  Skipped:   {skipped_count} records (→ extended search queue)")
+        print(f"  API rows:  {total_records} results written to {output_file}")
+        _verify_row_count(output_file, total_records + skipped_count)
 
 
 def main():
@@ -299,25 +443,25 @@ def main():
       - Otherwise → run primary search with itemSubType fallback cycling:
           Try each subtype in ITEM_SUBTYPES_FALLBACK until results are found.
           If all subtypes return 0 results → write a skipped row with skip_reason='NO_MATCH'
+
+    Resume mode (--resume command-line flag):
+      Skips _remove_existing_output() and _write_csv_header() so the existing
+      oclc_results.csv is preserved and appended to, rather than overwritten.
+      Records whose lookup_id already appears in oclc_results.csv are skipped
+      entirely (not re-searched), so a run interrupted partway through (e.g.
+      by a token expiring) can continue from where it left off without
+      repeating already-completed API calls.
+
+    Setup (credential check, search_terms loading/filtering, CSV header) is
+    handled by _prepare_for_run(); the closing summary is handled by
+    _print_run_summary(). This keeps the loop itself as the main focus here.
     """
+    resume = '--resume' in sys.argv
     output_file = "oclc_results.csv"
-    _remove_existing_output(output_file)
 
-    print("Getting token from OCLCAuth...")
-    token = auth_handler.get_valid_token()
-    if not token:
-        print("Failed to retrieve access token. Check your credentials.")
+    search_terms, already_completed = _prepare_for_run(resume, output_file)
+    if search_terms is None:
         sys.exit(1)
-
-    print("Loading search terms...")
-    search_terms = load_search_terms("search_terms.tsv")
-
-    if not search_terms:
-        print("No search terms found or could not parse the file.")
-        sys.exit(1)
-
-    print(f"Found {len(search_terms)} search terms to process.")
-    _write_csv_header(output_file)
 
     total_records = 0
     skipped_count = 0
@@ -337,7 +481,7 @@ def main():
             continue
 
         try:
-            records_written, matched_subtype = _search_with_subtypes(term, token, output_file)
+            records_written, matched_subtype = _search_with_subtypes(term, output_file)
             if matched_subtype:
                 total_records += records_written
                 print(f"  Matched on itemSubType={matched_subtype} "
@@ -355,11 +499,9 @@ def main():
         if i + 1 < len(search_terms):
             time.sleep(1)
 
-    print("\nDone!")
-    print(f"  Searched:  {len(search_terms) - skipped_count} records")
-    print(f"  Skipped:   {skipped_count} records (→ extended search queue)")
-    print(f"  API rows:  {total_records} results written to {output_file}")
-    _verify_row_count(output_file, total_records + skipped_count)
+    _print_run_summary(
+        resume, search_terms, skipped_count, total_records, already_completed, output_file
+    )
 
 
 if __name__ == "__main__":

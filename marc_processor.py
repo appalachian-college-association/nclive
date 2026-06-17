@@ -797,7 +797,7 @@ class InfobaseMARCProcessor:
         # Write search terms file (only xtid records)
         output_path = Path(output_file)
         with open(output_path, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file, delimiter='\t')
+            writer = csv.writer(file, delimiter='\t', quoting=csv.QUOTE_NONE, escapechar='\\')
             writer.writerow([
                 'lookupIDcollection',
                 'discovery-api-search',
