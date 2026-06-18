@@ -48,7 +48,7 @@ except ImportError:
     DEFAULT_LIBRARY = "ACACL" # Fallback to local holdings
     RESTRICT_TO_LIBRARY = False # Fallback to global search
 
-# TESTING ONLY: institution AID/library ID used to build clickable AVOD/JFK
+# Montreat college AID/library ID used to build clickable AVOD/JFK
 # links in the manual review CSV (infobase_link column). Sourced from .env via
 # config.py — never hardcoded here, and never used in KBART title_id/title_url
 # output (those must keep a blank ?aid= placeholder for Collection Manager).
@@ -60,28 +60,45 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class ExtendedMARCProcessor:
+class ExtendedMARCProcessor:  # pylint: disable=too-many-instance-attributes
     """
     Extended processor for handling manual review items with enhanced OCLC searches.
     Simplified version - KBART processing moved to separate files.
+
+    too-many-instance-attributes is suppressed: the extra attribute beyond the
+    threshold (self.search_terms_file / self._numeric_id_result_cache) supports
+    the search_terms.tsv join and per-numeric-ID result caching added for the
+    sequential search redesign — splitting the class further wouldn't reduce
+    real complexity here.
     """
 
     def __init__(self,
                  updated_lookup_file: str = "InfobaseLookup_updated.csv",
-                 manual_review_output: str = "manual_review_searches.csv"):
+                 manual_review_output: str = "manual_review_searches.csv",
+                 search_terms_file: str = "search_terms.tsv"):
         """
         Initialize the extended processor.
 
         Args:
             updated_lookup_file: Path to InfobaseLookup_updated.csv
             manual_review_output: Output file for manual review searches
+            search_terms_file: Path to search_terms.tsv (produced by
+                marc_processor.py, consumed by main.py). Supplies the
+                au-fragment/se-fragment query pieces and the mn/au review
+                flags used to build extended search queries.
         """
         self.updated_lookup_file = Path(updated_lookup_file)
         self.manual_review_output = Path(manual_review_output)
+        self.search_terms_file = Path(search_terms_file)
 
         # Storage for data
         self.manual_review_records = []
         self.extended_search_results = []
+
+        # Caches search results per unique numeric xtid, so records sharing
+        # the same numeric ID (e.g. the same title in both $fod and $jfk
+        # collections) are searched only once and share the result.
+        self._numeric_id_result_cache: Dict[str, Dict] = {}
 
         # Statistics tracking
         self.stats = {
@@ -99,12 +116,77 @@ class ExtendedMARCProcessor:
         # Authentication token (will be set when needed)
         self.access_token = None
 
-    def load_manual_review_items(self) -> List[Dict]:
+    def load_search_terms(self) -> Dict[str, Dict]:
         """
-        Load items marked for manual review from InfobaseLookup_updated.csv.
+        Load search_terms.tsv (produced by marc_processor.py, consumed by
+        main.py) and return a dict keyed by lookupIDcollection.
+
+        Uses the same csv.reader settings as main.py's load_search_terms()
+        (delimiter, quoting, escapechar) so the au-fragment/se-fragment
+        text — which contains embedded escaped quotes — decodes the same way
+        it was encoded by marc_processor.py's generate_search_terms().
 
         Returns:
-            List of records needing manual review
+            Dict mapping lookupIDcollection -> {
+                'au_fragment': str,  # e.g. ' AND au:"BBC Worldwide Learning"' or ''
+                'se_fragment': str,  # e.g. ' AND se:"Wild New World"' or ''
+                'mn_flag': str,      # 'Y' or 'N'
+                'au_flag': str,      # 'Y' or 'N'
+            }
+            Empty dict if the file doesn't exist or can't be read.
+        """
+        terms_by_id: Dict[str, Dict] = {}
+
+        if not self.search_terms_file.exists():
+            logger.warning(
+                "search_terms.tsv not found at %s — au/se fragments and "
+                "review flags will be unavailable", self.search_terms_file
+            )
+            return terms_by_id
+
+        try:
+            with open(self.search_terms_file, "r", newline='', encoding="utf-8") as file:
+                reader = csv.reader(
+                    file, delimiter='\t', quoting=csv.QUOTE_NONE, escapechar='\\'
+                )
+                next(reader, None)  # Skip header row
+                for parts in reader:
+                    if not parts:
+                        continue
+                    lookup_id_collection = parts[0].strip()
+                    # NOTE: au_fragment/se_fragment use rstrip(), not strip().
+                    # generate_search_terms() writes these with a deliberate
+                    # leading space (e.g. ' AND au:"Name"') so they can be
+                    # appended directly as an AND-clause suffix. A plain
+                    # .strip() would remove that leading space and produce
+                    # a malformed query like 'ti:"Title"AND au:"Name"'.
+                    terms_by_id[lookup_id_collection] = {
+                        'au_fragment': parts[2].rstrip('\r\n') if len(parts) > 2 else '',
+                        'se_fragment': parts[3].rstrip('\r\n') if len(parts) > 3 else '',
+                        'mn_flag': parts[4].strip() if len(parts) > 4 else 'N',
+                        'au_flag': parts[5].strip() if len(parts) > 5 else 'N',
+                    }
+            logger.info("Loaded %s search terms from %s", len(terms_by_id), self.search_terms_file)
+        except (OSError, csv.Error) as e:
+            logger.error("Error loading search terms: %s", e)
+
+        return terms_by_id
+
+    def load_manual_review_items(self) -> List[Dict]:
+        """
+        Load items marked for manual review from InfobaseLookup_updated.csv,
+        then join in au-fragment/se-fragment/mn_flag/au_flag from
+        search_terms.tsv by lookupIDcollection.
+
+        Manual review records are expected to be a subset of search_terms.tsv
+        (they're the rows main.py's primary search skipped or didn't match),
+        so every manual review row should normally find a match. Rows that
+        don't are logged and proceed with empty fragments / 'N' flags, which
+        falls back to the original title+mn+kw-only search behavior.
+
+        Returns:
+            List of records needing manual review, each with fragment/flag
+            keys merged in.
         """
         logger.info("Loading manual review items from %s", self.updated_lookup_file)
 
@@ -121,7 +203,25 @@ class ExtendedMARCProcessor:
                 (df['source'] == 'MANUAL_REVIEW')
             ].copy()
 
-            self.manual_review_records = manual_review_df.to_dict('records')
+            search_terms_by_id = self.load_search_terms()
+
+            records = manual_review_df.to_dict('records')
+            unmatched_count = 0
+            for record in records:
+                lookup_id_collection = record.get('lookupIDcollection', '')
+                terms = search_terms_by_id.get(lookup_id_collection)
+                if terms is None:
+                    unmatched_count += 1
+                    terms = {'au_fragment': '', 'se_fragment': '', 'mn_flag': 'N', 'au_flag': 'N'}
+                record.update(terms)
+
+            if unmatched_count:
+                logger.warning(
+                    "%s manual review record(s) had no matching row in search_terms.tsv "
+                    "— proceeding with empty fragments for those", unmatched_count
+                )
+
+            self.manual_review_records = records
 
             # Calculate statistics
             self.stats['total_manual_review'] = len(self.manual_review_records)
@@ -236,188 +336,47 @@ class ExtendedMARCProcessor:
 
         return self.access_token
 
-    def search_oclc_by_title(self, title: str, max_results: int = 5) -> List[Dict]:
+    def _extract_numeric_id(self, lookup_id: str) -> Optional[str]:
         """
-        Search OCLC Discovery API by title.
+        Extract the numeric xtid from a lookup_id string for use in mn: searches.
 
-        Args:
-            title: Title to search for
-            max_results: Maximum number of results to return
-
-        Returns:
-            List of matching records
-        """
-        if not title:
-            return []
-        try:
-            clean_title = self.clean_title_for_search(title)
-            if not clean_title:
-                return []
-            # Build query - search for electronic video format with title
-            query = f'ti:"{clean_title}"'
-            headers = {
-                "Authorization": f"Bearer {self.get_token_cached()}",
-                "Accept": "application/json"
-            }
-            params = {
-                "q": query,
-                "limit": max_results,
-                "itemSubType": "video-digital",
-            }
-            if RESTRICT_TO_LIBRARY:
-                params["heldByLibrary"] = DEFAULT_LIBRARY
-                logger.debug("Restricting search to library %s", DEFAULT_LIBRARY)
-            else:
-                logger.debug("Performing global search (all libraries)")
-
-            logger.info("Searching OCLC by title: %s", query)
-            response = requests.get(API_URL, headers=headers, params=params, timeout=(10,30))
-            response.raise_for_status()
-            data = response.json()
-            records = data.get("briefRecords", [])
-            # Filter for electronic videos
-            video_records = []
-            for record in records:
-                if (record.get("generalFormat") == "Video" and
-                    record.get("specificFormat") == "Digital"):
-                    video_records.append({
-                        'oclc_number': record.get("oclcNumber", ""),
-                        'title': record.get("title", ""),
-                        'general_format': record.get("generalFormat", ""),
-                        'specific_format': record.get("specificFormat", ""),
-                        'search_type': 'title_search'
-                    })
-            return video_records
-
-        except requests.exceptions.RequestException as e:
-            logger.error("Error searching by title '%s': %s", title, e)
-            self.stats['api_errors'] += 1
-            return []
-
-    def search_oclc_by_series(self, series: str, max_results: int = 3) -> List[Dict]:
-        """
-        Search OCLC Discovery API by series name.
-
-        Args:
-            series: Series name to search for
-            max_results: Maximum number of results to return
-
-        Returns:
-            List of matching records
-        """
-        if not series:
-            return []
-
-        try:
-            # Search both title field and series field for the series name
-            queries = [
-                f'se:"{series}"',   # Series field (MARC 830)
-                f'ti:"{series}"',   # Series name searched as title
-            ]
-
-            all_results = []
-
-            for query in queries:
-                headers = {
-                    "Authorization": f"Bearer {self.get_token_cached()}",
-                    "Accept": "application/json"
-                }
-                params = {
-                    "q": query,
-                    "limit": max_results,
-                    "itemSubType": "video-digital",
-                }
-
-                if RESTRICT_TO_LIBRARY:
-                    params["heldByLibrary"] = DEFAULT_LIBRARY
-                    logger.debug("Restricting search to library %s", DEFAULT_LIBRARY)
-                else:
-                    logger.debug("Performing global search (all libraries)")
-
-                logger.info("Searching OCLC by series: %s", query)
-                response = requests.get(API_URL, headers=headers, params=params, timeout=(10,30))
-                response.raise_for_status()
-
-                data = response.json()
-                records = data.get("briefRecords", [])
-
-                # Filter for electronic videos
-                for record in records:
-                    if (record.get("generalFormat") == "Video" and
-                        record.get("specificFormat") == "Digital"):
-                        result = {
-                            'oclc_number': record.get("oclcNumber", ""),
-                            'title': record.get("title", ""),
-                            'general_format': record.get("generalFormat", ""),
-                            'specific_format': record.get("specificFormat", ""),
-                            'search_type': 'series_search'
-                        }
-
-                        # Avoid duplicates
-                        if not any(r['oclc_number'] == result['oclc_number'] for r in all_results):
-                            all_results.append(result)
-
-                # Brief pause between queries
-                time.sleep(0.5)
-
-            return all_results[:max_results]  # Limit total results
-
-        except requests.exceptions.RequestException as e:
-            logger.error("Error searching by series '%s': %s", series, e)
-            self.stats['api_errors'] += 1
-            return []
-
-
-    def search_oclc_by_infobase_id(self, lookup_id: str, max_results: int = 5) -> List[Dict]:
-        """
-        Search OCLC Discovery API using the main.py query format without kw:Infobase.
-        This mimics the main.py search but removes the Infobase keyword constraint.
-
-        IMPORTANT: Only searches on xtid values, NOT customid values.
-        customid values don't correspond to MARC 028 fields and cause bad matches.
+        IMPORTANT: Only returns a value for xtid= format. customid= values don't
+        correspond to MARC 028 fields and would cause bad matches if used with mn:.
 
         Args:
             lookup_id: The lookup ID (e.g., "xtid=296504$")
+
+        Returns:
+            The numeric ID string, or None if not an xtid-format lookup_id.
+        """
+        if not lookup_id:
+            return None
+
+        xtid_match = re.search(r'xtid=(.+)\$', lookup_id)
+        if xtid_match:
+            return xtid_match.group(1)
+
+        customid_match = re.search(r'customid=(.+)\$', lookup_id)
+        if customid_match:
+            logger.warning(
+                "Skipping mn: search for customid (doesn't match MARC 028): %s", lookup_id
+            )
+        else:
+            logger.warning("Could not extract xtid from lookup_id: %s", lookup_id)
+        return None
+
+    def _run_single_query(self, query: str, max_results: int = 5) -> List[Dict]:
+        """
+        Execute a single Discovery API query and return filtered video-digital records.
+
+        Args:
+            query: The fully-built q= query string
             max_results: Maximum number of results to return
 
         Returns:
-            List of matching records
+            List of matching record dicts (empty list on no results or error)
         """
-
-        if not lookup_id:
-            return []
-
         try:
-            # Extract numeric ID from lookup_id format
-            # ONLY search on xtid values - these correspond to MARC 028 fields
-            xtid_match = re.search(r'xtid=(.+)\$', lookup_id)
-
-            if not xtid_match:
-                # Check if this is a customid - these should NOT be searched via sn:
-                customid_match = re.search(r'customid=(.+)\$', lookup_id)
-                if customid_match:
-                    logger.warning(
-                        "Skipping infobase ID search for customid (doesn't match MARC 028): %s",
-                        lookup_id
-                        )
-                    return []  # Return empty - customid can't be searched this way
-
-                logger.warning("Could not extract xtid from lookup_id: %s", lookup_id)
-                return []
-
-            numeric_id = xtid_match.group(1)
-
-
-            # itemSubType=video-digital is passed as a separate URL parameter (not in q=)
-            query = f'mn:{numeric_id} AND pb:Infobase'
-
-            # Build query using mn: (MARC 028$a / publisher number) — correct index
-            # pb:Infobase tested against kw:(Infobase OR "Access Video" OR Films) on 8
-            # manual-review records (see test_pb_vs_kw_anchor.py, 2026-06-17) — identical
-            # results on every test case, no matches missed by the narrower form.
-            # # itemSubType=video-digital is passed as a separate URL parameter (not in q=)
-            query = f'mn:{numeric_id} AND pb:Infobase'
-
             headers = {
                 "Authorization": f"Bearer {self.get_token_cached()}",
                 "Accept": "application/json"
@@ -427,87 +386,15 @@ class ExtendedMARCProcessor:
                 "limit": max_results,
                 "itemSubType": "video-digital",
             }
-
             if RESTRICT_TO_LIBRARY:
                 params["heldByLibrary"] = DEFAULT_LIBRARY
                 logger.debug("Restricting search to library %s", DEFAULT_LIBRARY)
             else:
                 logger.debug("Performing global search (all libraries)")
 
-            logger.info("Searching OCLC by infobase query: %s", query)
-            response = requests.get(API_URL, headers=headers, params=params, timeout=(10,30))
+            logger.info("Searching OCLC: %s", query)
+            response = requests.get(API_URL, headers=headers, params=params, timeout=(10, 30))
             response.raise_for_status()
-
-            data = response.json()
-            records = data.get("briefRecords", [])
-
-            # Filter for digital videos (same as other search methods)
-            video_records = []
-            for record in records:
-                if (record.get("generalFormat") == "Video" and
-                record.get("specificFormat") == "Digital"):
-                    video_records.append({
-                        'oclc_number': record.get("oclcNumber", ""),
-                        'title': record.get("title", ""),
-                        'general_format': record.get("generalFormat", ""),
-                        'specific_format': record.get("specificFormat", ""),
-                        'search_type': 'infobase_id_search'
-                    })
-
-            return video_records
-
-        except requests.exceptions.RequestException as e:
-            logger.error("Error searching by infobase query '%s': %s", lookup_id, e)
-            self.stats['api_errors'] += 1
-            return []
-
-
-    def search_oclc_by_corporate_name(
-        self, corporate_name: str, title: str, max_results: int = 5
-    ) -> List[Dict]:
-        """
-        Search OCLC by corporate name (au:) combined with title (ti:).
-
-        Used when mn: search is unavailable or returned no results.
-        Combines au: (from MARC 710$a) with ti: (from MARC 245$a) for precision.
-
-        Args:
-            corporate_name: Cleaned 710$a value (e.g. 'Digital Classics')
-            title:          Title string from MARC 245$a for ti: search
-            max_results:    Maximum number of results to return
-
-        Returns:
-            List of matching record dicts
-        """
-        if not corporate_name:
-            return []
-
-        try:
-            clean_title = self.clean_title_for_search(title)
-
-            # Build query: au: alone if no clean title; combined if both present
-            if clean_title:
-                query = f'au:"{corporate_name}" AND ti:"{clean_title}"'
-            else:
-                query = f'au:"{corporate_name}"'
-
-            headers = {
-                "Authorization": f"Bearer {self.get_token_cached()}",
-                "Accept": "application/json"
-            }
-            params = {
-                "q": query,
-                "limit": max_results,
-                "itemSubType": "video-digital",
-            }
-
-            if RESTRICT_TO_LIBRARY:
-                params["heldByLibrary"] = DEFAULT_LIBRARY
-
-            logger.info("Searching OCLC by corporate name: %s", query)
-            response = requests.get(API_URL, headers=headers, params=params, timeout=(10,30))
-            response.raise_for_status()
-
             data = response.json()
             records = data.get("briefRecords", [])
 
@@ -520,35 +407,219 @@ class ExtendedMARCProcessor:
                         'title': record.get("title", ""),
                         'general_format': record.get("generalFormat", ""),
                         'specific_format': record.get("specificFormat", ""),
-                        'search_type': 'corporate_name_search',
                     })
-
             return video_records
 
         except requests.exceptions.RequestException as e:
-            logger.error("Error searching by corporate name '%s': %s", corporate_name, e)
+            logger.error("Error running query '%s': %s", query, e)
             self.stats['api_errors'] += 1
             return []
 
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def _build_sequential_queries(
+        self, clean_title: str, numeric_id: Optional[str],
+        au_fragment: str, se_fragment: str,
+        mn_flag: str, au_flag: str
+    ) -> List[tuple]:
+        """
+        Build the ordered list of (search_number, description, query) tuples to try.
+
+        Searches run in this order and stop at the first match:
+          1. ti: + mn:        (title + Infobase publisher number)
+          2. ti: + au_fragment (title + corporate name, from search_terms.tsv)
+          3. ti: + se_fragment (title + series, from search_terms.tsv)
+          4. mn: + se_fragment (Infobase publisher number + series)
+          5. ti: alone        (title only)
+          6. mn: + kw:        (Infobase publisher number + broad keyword fallback)
+
+        au_fragment and se_fragment come pre-formatted from search_terms.tsv
+        (e.g. ' AND au:"BBC Worldwide Learning"') and are appended as suffixes,
+        so search 2 reads as ti:"{title}" AND au:"{name}" rather than
+        au:"{name}" AND ti:"{title}" — equivalent for the API since AND is
+        order-independent, just reordered for reuse of the existing fragment text.
+
+        mn_flag='Y' means there's no real MARC 028 publisher number for this
+        record (main.py's search_term would be a placeholder), so any search
+        anchored on mn: (1, 4, 6) is skipped. au_flag='Y' means au_fragment is
+        empty (no corporate_name), so search 2 is skipped — checking the flag
+        directly (rather than just the fragment) mirrors main.py's own
+        skip-routing logic.
+
+        Series searches (3, 4) are skipped entirely if se_fragment is blank,
+        since an empty se: clause returns zero results from the Discovery API
+        rather than being ignored. Series is never searched alone, since se:
+        alone returns every title in the series.
+
+        Args:
+            clean_title: Cleaned title string (may be empty)
+            numeric_id: Extracted xtid numeric value, or None if unavailable
+            au_fragment: Pre-formatted ' AND au:"Name"' suffix, or ''
+            se_fragment: Pre-formatted ' AND se:"Series"' suffix, or ''
+            mn_flag: 'Y' if no real MARC 028 (mn:) value, else 'N'
+            au_flag: 'Y' if no corporate_name (au_fragment empty), else 'N'
+
+        Returns:
+            List of (search_number, description, query) tuples to attempt in order
+        """
+        queries = []
+        has_mn = numeric_id and mn_flag != 'Y'
+        has_au = au_fragment and au_flag != 'Y'
+        has_se = bool(se_fragment)
+
+        if clean_title and has_mn:
+            queries.append((
+                1, 'ti+mn',
+                f'ti:"{clean_title}" AND mn:{numeric_id}'
+            ))
+
+        if clean_title and has_au:
+            queries.append((
+                2, 'ti+au',
+                f'ti:"{clean_title}"{au_fragment}'
+            ))
+
+        if clean_title and has_se:
+            queries.append((
+                3, 'ti+se',
+                f'ti:"{clean_title}"{se_fragment}'
+            ))
+
+        if has_mn and has_se:
+            queries.append((
+                4, 'mn+se',
+                f'mn:{numeric_id}{se_fragment}'
+            ))
+
+        if clean_title:
+            queries.append((
+                5, 'ti_only',
+                f'ti:"{clean_title}"'
+            ))
+
+        # Search 6 (mn + broad kw fallback) runs last by design: the loose kw:
+        # clause (which matches the generic word "Films") increases the chance
+        # of a non-title match, so it's only tried after every more-specific
+        # option has failed.
+        if has_mn:
+            queries.append((
+                6, 'mn+kw',
+                f'mn:{numeric_id} AND kw:(Infobase OR "Access Video" OR Films)'
+            ))
+
+        return queries
+
+    def _extract_search_fields(self, record: Dict) -> tuple:
+        """
+        Pull the fields needed for sequential search out of a manual review
+        record. Centralizes the .get() calls with their defaults in one place.
+
+        Returns:
+            (title, numeric_id, au_fragment, se_fragment, mn_flag, au_flag)
+        """
+        title = record.get('title', '')
+        lookup_id = record.get('lookupID', '')
+        numeric_id = self._extract_numeric_id(lookup_id)
+        au_fragment = record.get('au_fragment', '')
+        se_fragment = record.get('se_fragment', '')
+        mn_flag = record.get('mn_flag', 'N')
+        au_flag = record.get('au_flag', 'N')
+        return title, numeric_id, au_fragment, se_fragment, mn_flag, au_flag
+
+    def run_sequential_searches(self, record: Dict) -> Dict:
+        """
+        Run the ordered sequence of Discovery API searches for one manual review
+        record, stopping at the first query that returns a match.
+
+        Records sharing the same numeric xtid (e.g. the same title appearing
+        in both the $fod and $jfk collection rows) are only searched once —
+        the first call for a given numeric_id runs the queries and caches the
+        result; subsequent calls for the same numeric_id reuse that cached
+        result instead of repeating the API calls. Records with no extractable
+        numeric_id (e.g. customid records) are never cached, since they have
+        no shared key to dedup on.
+
+        Args:
+            record: A manual review record dict (from manual_review_records),
+                expected to include au_fragment/se_fragment/mn_flag/au_flag
+                merged in from search_terms.tsv by load_manual_review_items()
+
+        Returns:
+            Dict with keys:
+                'matches': list of matching record dicts (empty if none found)
+                'search_number': int (1-6) of the search that found a match, or None
+                'search_description': short label for which fields were used, or ''
+        """
+        title, numeric_id, au_fragment, se_fragment, mn_flag, au_flag = (
+            self._extract_search_fields(record)
+        )
+
+        if numeric_id and numeric_id in self._numeric_id_result_cache:
+            logger.info(
+                "  Reusing cached result for numeric_id %s (shared across collections)",
+                numeric_id
+            )
+            return self._numeric_id_result_cache[numeric_id]
+
+        clean_title = self.clean_title_for_search(title)
+
+        queries = self._build_sequential_queries(
+            clean_title, numeric_id, au_fragment, se_fragment, mn_flag, au_flag
+        )
+
+        result = self._run_queries_until_match(queries)
+
+        if numeric_id:
+            self._numeric_id_result_cache[numeric_id] = result
+
+        return result
+
+    def _run_queries_until_match(self, queries: List[tuple]) -> Dict:
+        """
+        Run a list of (search_number, description, query) tuples in order,
+        stopping at the first one that returns matches.
+
+        Returns:
+            Dict with 'matches', 'search_number', 'search_description' keys
+        """
+        for search_number, description, query in queries:
+            matches = self._run_single_query(query)
+            # Brief pause between queries to stay within rate limits
+            time.sleep(0.5)
+            if matches:
+                for match in matches:
+                    match['search_type'] = f'SEARCH_{search_number}_MATCH'
+                logger.info(
+                    "  Search %s (%s) matched: %s", search_number, description, query
+                )
+                return {
+                    'matches': matches,
+                    'search_number': search_number,
+                    'search_description': description,
+                }
+
+        logger.info("  No matches found across %s attempted searches", len(queries))
+        return {'matches': [], 'search_number': None, 'search_description': ''}
+
     # --- Private helpers to reduce complexity in large methods ---
 
-    def _get_recommended_action(
-        self,
-        infobase_id_matches: list,
-        corporate_name_matches: list,
-        title_matches: list,
-        series_matches: list
-    ) -> str:
-        """Return the highest-priority recommended action string."""
-        if infobase_id_matches:
-            return 'INFOBASE_ID_MATCH'
-        if corporate_name_matches:
-            return 'CORPORATE_NAME_MATCH'
-        if title_matches:
-            return 'TITLE_MATCH'
-        if series_matches:
-            return 'SERIES_MATCH'
-        return 'NO_MATCH'
+    # Maps each search number (1-6) to the closest existing stat bucket /
+    # recommended_action category, so generate_statistics_report() and the
+    # FOD/JFK breakdown keep working without changes. match_type in the CSV
+    # output still shows the specific SEARCH_N_MATCH label (see _build_match_record).
+    _SEARCH_NUMBER_TO_BUCKET = {
+        1: 'INFOBASE_ID_MATCH',     # ti+mn
+        2: 'CORPORATE_NAME_MATCH',  # au+ti
+        3: 'TITLE_MATCH',           # ti+se
+        4: 'SERIES_MATCH',          # mn+se
+        5: 'TITLE_MATCH',           # ti alone
+        6: 'INFOBASE_ID_MATCH',     # mn+kw
+    }
+
+    def _get_recommended_action(self, search_number: Optional[int]) -> str:
+        """Return the recommended action bucket for the winning search number."""
+        if search_number is None:
+            return 'NO_MATCH'
+        return self._SEARCH_NUMBER_TO_BUCKET.get(search_number, 'NO_MATCH')
 
     def _build_infobase_link(
         self, lookup_id: str, collection_type: str, avod_title_id: str = ''
@@ -572,53 +643,22 @@ class ExtendedMARCProcessor:
     def _build_match_record(self, base_record: dict, result: dict) -> dict:
         """Build a single flattened match record for CSV output."""
         record = base_record.copy()
-        if result['infobase_id_matches']:
-            match = result['infobase_id_matches'][0]
+        matches = result.get('matches', [])
+
+        if matches:
+            match = matches[0]
+            search_number = result.get('search_number')
+            search_description = result.get('search_description', '')
+            notes = f'Search {search_number} ({search_description}) match'
+            if search_number in (3, 4):
+                notes += f' — series: {result.get("extracted_series", "")}'
             record.update({
-                'match_type': 'INFOBASE_ID_MATCH',
+                'match_type': match.get('search_type', 'NO_MATCH'),
                 'match_rank': 1,
                 'suggested_oclc': match['oclc_number'],
                 'suggested_title': self.clean_text_for_export(match['title']),
                 'match_format': f"{match['general_format']}-{match['specific_format']}",
-                'manual_review_notes': 'First infobase ID match',
-                'verifiedOCN': '',
-                'accept_suggestion': ''
-            })
-        elif result.get('corporate_name_matches'):
-            match = result['corporate_name_matches'][0]
-            record.update({
-                'match_type': 'CORPORATE_NAME_MATCH',
-                'match_rank': 1,
-                'suggested_oclc': match['oclc_number'],
-                'suggested_title': self.clean_text_for_export(match['title']),
-                'match_format': f"{match['general_format']}-{match['specific_format']}",
-                'manual_review_notes': 'Corporate name + title match (710$a + 245$a)',
-                'verifiedOCN': '',
-                'accept_suggestion': ''
-            })
-        elif result['title_matches']:
-            match = result['title_matches'][0]
-            record.update({
-                'match_type': 'TITLE_MATCH',
-                'match_rank': 1,
-                'suggested_oclc': match['oclc_number'],
-                'suggested_title': self.clean_text_for_export(match['title']),
-                'match_format': f"{match['general_format']}-{match['specific_format']}",
-                'manual_review_notes': 'First title match',
-                'verifiedOCN': '',
-                'accept_suggestion': ''
-            })
-        elif result['series_matches']:
-            match = result['series_matches'][0]
-            record.update({
-                'match_type': 'SERIES_MATCH',
-                'match_rank': 1,
-                'suggested_oclc': match['oclc_number'],
-                'suggested_title': match['title'],
-                'match_format': f"{match['general_format']}-{match['specific_format']}",
-                'manual_review_notes': (
-                    f'Series-level match for: {result.get("extracted_series", "")}'
-                ),
+                'manual_review_notes': notes,
                 'verifiedOCN': '',
                 'accept_suggestion': ''
             })
@@ -636,14 +676,30 @@ class ExtendedMARCProcessor:
         return record
 
     def _get_update_source(self, match_type: str) -> str:
-        """Map match_type to a source label for lookup updates."""
-        source_map = {
-            'INFOBASE_ID_MATCH': 'API_INFOBASE_ID',
-            'TITLE_MATCH': 'API_EXT_TITLE',
-            'SERIES_MATCH': 'API_EXT_SERIES',
-            'NO_MATCH': 'MANUAL_ENTRY',
+        """Map match_type to a source label for lookup updates.
+
+        match_type values are now 'SEARCH_1_MATCH' through 'SEARCH_6_MATCH'
+        (set in run_sequential_searches), or 'NO_MATCH'. Each search number maps
+        to a source label reflecting which fields found the match.
+        """
+        search_number_source_map = {
+            1: 'API_EXT_TITLE_MN',      # ti+mn
+            2: 'API_EXT_CORPORATE',     # au+ti
+            3: 'API_EXT_TITLE_SERIES',  # ti+se
+            4: 'API_EXT_MN_SERIES',     # mn+se
+            5: 'API_EXT_TITLE',         # ti alone
+            6: 'API_EXT_MN_KW',         # mn+kw fallback
         }
-        return source_map.get(match_type, 'API_EXT_SEARCH')
+
+        if match_type == 'NO_MATCH':
+            return 'MANUAL_ENTRY'
+
+        match = re.match(r'SEARCH_(\d)_MATCH', str(match_type))
+        if match:
+            search_number = int(match.group(1))
+            return search_number_source_map.get(search_number, 'API_EXT_SEARCH')
+
+        return 'API_EXT_SEARCH'
 
     def _collect_accepted_updates(self, reviewed_df: pd.DataFrame) -> dict:
         """Extract accepted OCN updates from a manually reviewed DataFrame."""
@@ -713,9 +769,104 @@ class ExtendedMARCProcessor:
             updated_df.loc[mask_fallback, 'source'] = updates['source']
             updated_df.loc[mask_fallback, 'last_updated'] = today
 
+    # Maps each recommended_action bucket to its stats counter key, used when
+    # tallying a match found by _build_search_result_for_record().
+    _BUCKET_TO_STAT_KEY = {
+        'INFOBASE_ID_MATCH': 'infobase_id_matches_found',
+        'CORPORATE_NAME_MATCH': 'corporate_name_matches_found',
+        'TITLE_MATCH': 'title_matches_found',
+        'SERIES_MATCH': 'series_matches_found',
+    }
+
+    def _extract_series_for_display(self, se_fragment: str, title: str) -> str:
+        """
+        Extract a bare series name for display/reporting purposes only.
+
+        se_fragment from search_terms.tsv is pre-formatted as
+        ' AND se:"Series Name"' for use directly in queries; this pulls out
+        just "Series Name" for the extracted_series report column. Falls back
+        to the regex-based title extraction (matching original behavior) if
+        se_fragment is empty.
+
+        Args:
+            se_fragment: Pre-formatted se: fragment, or ''
+            title: Original title, used as fallback source
+
+        Returns:
+            Bare series name, or '' if none available
+        """
+        if se_fragment:
+            match = re.search(r'se:"([^"]*)"', se_fragment)
+            if match:
+                return match.group(1)
+        return self.extract_series_from_title(title) or ''
+
+    def _build_search_result_for_record(self, record: Dict) -> Dict:
+        """
+        Run the sequential searches for one record and assemble its search_result
+        dict, including the back-compat match-list keys that
+        generate_statistics_report() expects.
+
+        Also updates self.stats as a side effect, matching the behavior of the
+        original per-search-type loop.
+
+        Args:
+            record: A manual review record dict, expected to include
+                au_fragment/se_fragment/mn_flag/au_flag merged in from
+                search_terms.tsv by load_manual_review_items()
+
+        Returns:
+            The assembled search_result dict for this record
+        """
+        title = record.get('title', '')
+        se_fragment = record.get('se_fragment', '')
+        series_name = self._extract_series_for_display(se_fragment, title)
+
+        search_outcome = self.run_sequential_searches(record)
+        matches = search_outcome['matches']
+        search_number = search_outcome['search_number']
+
+        search_result = {
+            'original_lookup_id': record.get('lookupID', ''),
+            'original_title': title,
+            'collection_type': record.get('collection_type', ''),
+            'extracted_series': series_name,
+            'avod_title_id': record.get('avod_title_id', ''),  # From MARC 856$u
+            'matches': matches,
+            'search_number': search_number,
+            'search_description': search_outcome['search_description'],
+            # Back-compat keys for generate_statistics_report(), populated
+            # based on which search number produced the winning match.
+            'title_matches': matches if search_number in (3, 5) else [],
+            'series_matches': matches if search_number == 4 else [],
+            'infobase_id_matches': matches if search_number in (1, 6) else [],
+            'corporate_name_matches': matches if search_number == 2 else [],
+            'recommended_action': self._get_recommended_action(search_number),
+        }
+
+        if matches:
+            bucket = self._SEARCH_NUMBER_TO_BUCKET.get(search_number)
+            stat_key = self._BUCKET_TO_STAT_KEY.get(bucket)
+            if stat_key:
+                self.stats[stat_key] += 1
+            logger.info("  Found %s matches via search %s", len(matches), search_number)
+        else:
+            self.stats['no_matches_found'] += 1
+            logger.info("  No matches found")
+
+        return search_result
+
     def perform_extended_searches(self) -> List[Dict]:
         """
         Perform extended OCLC searches on all manual review items.
+
+        Each record runs through run_sequential_searches() (via
+        _build_search_result_for_record), which tries up to 6 queries in
+        priority order and stops at the first match. The winning search number
+        is then mapped back into the same four match-list keys
+        (infobase_id_matches, corporate_name_matches, title_matches,
+        series_matches) used by generate_statistics_report(), so the FOD/JFK
+        breakdown reporting works unchanged.
 
         Returns:
             List of extended search results
@@ -734,76 +885,9 @@ class ExtendedMARCProcessor:
                 i, len(self.manual_review_records), record.get('title', '')[:50]
                 )
 
-            title = record.get('title', '')
-            lookup_id = record.get('lookupID', '')
-            collection_type = record.get('collection_type', '')
-            corporate_name = record.get('corporate_name', '')   # From MARC 710$a
-            series_name = record.get('series_name', '')         # From MARC 830$a
-            avod_title_id = record.get('avod_title_id', '')     # From MARC 856$u (AVOD path)
+            results.append(self._build_search_result_for_record(record))
 
-            # Fall back to regex extraction only if series_name is empty
-            if not series_name:
-                series_name = self.extract_series_from_title(title)
-
-            search_result = {
-                'original_lookup_id': lookup_id,
-                'original_title': title,
-                'collection_type': collection_type,
-                'extracted_series': series_name,
-                'avod_title_id': avod_title_id,
-                'title_matches': [],
-                'series_matches': [],
-                'infobase_id_matches': [],
-                'corporate_name_matches': [],
-                'recommended_action': 'NO_MATCH'
-            }
-
-            # 1. Search by infobase ID (mn: + pb: publisher anchor)
-            infobase_id_matches = self.search_oclc_by_infobase_id(lookup_id)
-            search_result['infobase_id_matches'] = infobase_id_matches
-            if infobase_id_matches:
-                self.stats['infobase_id_matches_found'] += 1
-                logger.info("  Found %s infobase id matches", len(infobase_id_matches))
-
-            # 2. Search by corporate name (au: + ti:) if corporate_name available
-            corporate_name_matches = []
-            if corporate_name:
-                corporate_name_matches = self.search_oclc_by_corporate_name(corporate_name, title)
-                search_result['corporate_name_matches'] = corporate_name_matches
-                if corporate_name_matches:
-                    self.stats['corporate_name_matches_found'] += 1
-                    logger.info("  Found %s corporate name matches", len(corporate_name_matches))
-
-            # 3. Search by title
-            title_matches = self.search_oclc_by_title(title)
-            search_result['title_matches'] = title_matches
-            if title_matches:
-                self.stats['title_matches_found'] += 1
-                logger.info("  Found %s title matches", len(title_matches))
-
-            # 4. Search by series (if available)
-            series_matches = []
-            if series_name:
-                series_matches = self.search_oclc_by_series(series_name)
-                search_result['series_matches'] = series_matches
-                if series_matches:
-                    self.stats['series_matches_found'] += 1
-                    logger.info(
-                        "  Found %s series matches for '%s'", len(series_matches), series_name
-                        )
-
-            if not any([infobase_id_matches, corporate_name_matches,
-                        title_matches, series_matches]):
-                self.stats['no_matches_found'] += 1
-                logger.info("  No matches found")
-
-            search_result['recommended_action'] = self._get_recommended_action(
-                infobase_id_matches, corporate_name_matches, title_matches, series_matches
-            )
-
-            results.append(search_result)
-
-            # Rate limiting - pause between searches
+            # Rate limiting - pause between records
             time.sleep(1)
 
         self.extended_search_results = results
