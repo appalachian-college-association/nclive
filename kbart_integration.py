@@ -183,33 +183,50 @@ class KBARTFinalIntegrator:
     def load_final_lookup_data(self, lookup_file="InfobaseLookup_final.csv"):
         """
         Load the final lookup data with verified OCLC numbers.
-        FIXED: Only includes records that have corresponding MARC entries (last_updated = today).
+
+        Includes all records with a valid verifiedOCN whose last_updated date
+        falls within the current calendar month (YYYY-MM prefix match).
+
+        Using year-month rather than today's date handles the common case where
+        processing spans two dates in the same month — e.g. the initial MARC
+        run updates records on day 17 and manual review follow-up updates
+        additional records on day 18. Both dates share the same YYYY-MM prefix
+        and both appear in the final KBART output. Records from prior months
+        (earlier processing cycles) are excluded since they represent a
+        different delivery and should not be mixed into the current output.
         """
         try:
             df = pd.read_csv(lookup_file, dtype=str, keep_default_na=False)
 
-            # Get today's date for filtering
-            today = datetime.now().strftime('%Y-%m-%d')
+            # Current year-month prefix (e.g. "2026-06") for filtering.
+            # str.startswith() safely covers all dates within the month
+            # regardless of how many processing days the run spans.
+            current_year_month = datetime.now().strftime('%Y-%m')
 
-            # Filter for valid entries (not 'X' or empty) AND have MARC entry
+            # Filter for valid entries (not 'X' or empty) AND updated this month
             valid_df = df[
                 (df['verifiedOCN'] != 'X') &
                 (df['verifiedOCN'].notna()) &
                 (df['verifiedOCN'] != '') &
                 (df['verifiedOCN'] != 'nan') &
-                (df['last_updated'] == today)
+                (df['last_updated'].str.startswith(current_year_month))
             ].copy()
 
             self.stats['total_final_records'] = len(df)
             self.stats['records_with_marc'] = len(valid_df)
             self.stats['records_without_marc'] = len(df) - len(valid_df)
 
+            # Log the distinct dates included so it is easy to verify which
+            # processing days are covered in this output.
+            included_dates = sorted(valid_df['last_updated'].unique())
             logger.info("Loaded %s total entries from %s", len(df), lookup_file)
             logger.info(
-                "Found %s valid entries with MARC correspondence (updated today)", len(valid_df)
+                "Found %s valid entries updated in %s (dates: %s)",
+                len(valid_df), current_year_month, ', '.join(included_dates)
             )
             logger.info(
-                "Excluded %s entries without MARC files or invalid OCLC", len(df) - len(valid_df)
+                "Excluded %s entries from prior months or with invalid OCLC",
+                len(df) - len(valid_df)
             )
 
             return valid_df
@@ -261,9 +278,21 @@ class KBARTFinalIntegrator:
                 title_url = (
                     f"https://jfk.infobase.com/PortalPlaylists.aspx?{url_prefix}={numeric_id}"
                 )
-            else:  # fod without avod_title_id
-                logger.warning("Missing URL parameter for: %s", row.get('lookupID', ''))
-                return None
+            else:
+                # FOD record without avod_title_id: FOD is fully migrated to AVOD
+                # (access.infobase.com), so a missing avod_title_id means marc_processor.py
+                # didn't extract an access.infobase.com URL for this record — likely a
+                # data anomaly in the Infobase MARC delivery (old-platform URL still present).
+                # Fall back to the legacy fod.infobase.com URL so the record is not dropped.
+                # Investigate these titles with Infobase; they may need reprocessing when
+                # the MARC delivery is corrected.
+                logger.warning(
+                    "FOD record missing avod_title_id — using legacy URL fallback: %s",
+                    row.get('lookupID', '')
+                )
+                title_url = (
+                    f"https://fod.infobase.com/PortalPlaylists.aspx?{url_prefix}={numeric_id}"
+                )
 
         # Get OCLC number
         oclc_number = row.get('verifiedOCN', '')
@@ -437,7 +466,8 @@ class KBARTFinalIntegrator:
         if lookup_df.empty:
             logger.error("No valid lookup data found with MARC correspondence. Cannot proceed.")
             logger.error(
-                "Make sure InfobaseLookup_final.csv exists and contains records updated today."
+                "Make sure InfobaseLookup_final.csv exists and contains "
+                "records with last_updated in %s.", datetime.now().strftime('%Y-%m')
             )
             return False
 
@@ -486,7 +516,7 @@ def main():
         print("\n❌ Integration failed. Check logs for details.")
         print("Common issues:")
         print("- InfobaseLookup_final.csv not found or empty")
-        print("- No records with today's last_updated timestamp")
+        print("- No records with a last_updated date in the current year-month")
         print("- Missing MARC file match")
 
 if __name__ == "__main__":
