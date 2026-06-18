@@ -83,6 +83,7 @@ class InfobaseMARCProcessor:
             'matched_marc_035': 0,
             'needs_api_search': 0,
             'removed_records': 0,
+            'xtid_collisions': 0,
             'rejected_records': []  # Track records that get rejected
         }
 
@@ -362,18 +363,33 @@ class InfobaseMARCProcessor:
     ) -> Optional[str]:
         """Return a lookup ID for an access.infobase.com URL.
 
-        Uses 028$a xtid directly (URL cross-validation not possible on the new platform).
-        Falls back to the path segment when 028$a is absent.
+        For AVOD records, 028$a still contains the old xtid value and is the
+        authoritative lookup key. The xtid is used directly without URL
+        cross-validation, since the AVOD path ID in the URL is a different
+        namespace and the same number can refer to different titles on the two
+        platforms (e.g. xtid=4120 is "The Man who moved the mountains" while
+        the AVOD path /video/4120 is "Gabriel Garcia Marquez").
+
+        Fallback when 028$a is absent: use the AVOD URL path to construct an
+        avod= keyed lookup ID (e.g. 'avod=4120$') rather than an xtid= key.
+        This keeps the record in the pipeline for OCLC lookup by title while
+        ensuring it never collides with a legitimate xtid= entry.
         """
         for title_id in title_ids:
             title_id_clean = title_id.strip()
             if title_id_clean.isdigit():
                 return f"xtid={title_id_clean}$"
+        # No 028$a available — fall back to AVOD URL path, keyed as avod= not xtid=
         path_match = re.search(r'access\.infobase\.com/[^/?]+/([^/?]+)', url)
         if path_match:
             path_id = path_match.group(1)
             if path_id.isdigit():
-                return f"xtid={path_id}$"
+                logger.warning(
+                    "No 028$a found for AVOD record %s — using avod= fallback key. "
+                    "Record will route to title-based OCLC lookup (mn-review-flag=Y).",
+                    url
+                )
+                return f"avod={path_id}$"
         return None
 
     def _match_title_id_in_url(
@@ -714,7 +730,68 @@ class InfobaseMARCProcessor:
         self.current_records = all_records
         logger.info("Total records processed: %s", len(all_records))
 
+        # Detect and re-key any intra-MARC-delivery xtid collisions before
+        # any downstream processing sees self.current_records.  Doing it here
+        # ensures generate_search_terms, _apply_marc_updates, and
+        # create_updated_lookup_file all work from the already-corrected list.
+        self._detect_xtid_collisions()
+
         return all_records
+
+    def _detect_xtid_collisions(self) -> None:
+        """
+        Detect MARC records sharing the same lookup_id_collection (duplicate
+        xtid= values in the Infobase MARC delivery) and re-key the displaced
+        records in place in self.current_records.
+
+        Called immediately after process_marc_files() populates
+        self.current_records, so generate_search_terms(), _apply_marc_updates(),
+        and create_updated_lookup_file() all see the already-corrected list.
+
+        Re-keying uses avod_title_id to construct a synthetic unique lookupID
+        (avod=<path_numeric>$) so the displaced record flows through the full
+        pipeline — hierarchical lookup, generate_search_terms with
+        mn-review-flag=Y, and ultimately OCLC title-based search — rather than
+        being silently dropped by the dict comprehension in create_updated_lookup_file.
+
+        Records without avod_title_id that collide are logged as errors and
+        left with their original (duplicate) key; _apply_marc_updates will skip
+        them if they still collide at that stage.
+        """
+        seen: dict = {}
+        for idx, record in enumerate(self.current_records):
+            lic = record['lookup_id_collection']
+            if lic not in seen:
+                seen[lic] = idx
+                continue
+
+            # Collision detected — re-key this record
+            avod_title_id = record.get('avod_title_id', '')
+            if not avod_title_id:
+                logger.error(
+                    "Duplicate xtid collision for %s (title: '%s') but no avod_title_id "
+                    "available to re-key. Record may be silently dropped downstream.",
+                    lic, record.get('title', '')
+                )
+                continue
+
+            path_numeric = avod_title_id.split('/')[-1]
+            collection_type = record.get('collection_type', 'fod')
+            synthetic_lookup_id = f"avod={path_numeric}$"
+            new_lic = f"{synthetic_lookup_id}{collection_type}"
+
+            logger.warning(
+                "Duplicate xtid collision: '%s' seen at index %s and again at index %s. "
+                "Re-keying displaced record '%s' (avod_title_id: %s) as %s. "
+                "Report duplicate xtid to Infobase.",
+                lic, seen[lic], idx, record.get('title', ''), avod_title_id, new_lic
+            )
+
+            self.current_records[idx] = dict(record)  # copy to avoid mutating original
+            self.current_records[idx]['lookup_id'] = synthetic_lookup_id
+            self.current_records[idx]['lookup_id_collection'] = new_lic
+            self.stats['xtid_collisions'] += 1
+            seen[new_lic] = idx  # register new key so a triple-collision would also be caught
 
     def generate_search_terms(self, output_file: str = "search_terms.tsv") -> str:
         """
@@ -768,6 +845,29 @@ class InfobaseMARCProcessor:
                         au_flag,
                     ))
                     logger.debug("Added xtid for API search: %s", lookup_id_collection)
+
+                elif re.search(r'avod=(.+)\$', lookup_id):
+                    # avod= records are xtid duplicates re-keyed by _apply_marc_updates.
+                    # The original xtid is unreliable (shared with another title), so
+                    # mn: search is skipped (mn-review-flag=Y). Title-based and
+                    # corporate-name searches will be used instead via extended_marc_processor.
+                    corporate_name = record.get('corporate_name', '')
+                    au_fragment = f' AND au:"{corporate_name}"' if corporate_name else ''
+                    series_name = record.get('series_name', '')
+                    se_fragment = f' AND se:"{series_name}"' if series_name else ''
+                    au_flag = 'Y' if not corporate_name else 'N'
+                    search_terms.append((
+                        lookup_id_collection,
+                        '',      # no mn: search term — xtid is unreliable for this record
+                        au_fragment,
+                        se_fragment,
+                        'Y',     # mn-review-flag=Y: skip mn: search
+                        au_flag,
+                    ))
+                    logger.warning(
+                        "Re-keyed duplicate xtid record routed to title search: %s",
+                        lookup_id_collection
+                    )
 
                 else:
                     # Check if this is a customid - these should NOT be searched
@@ -938,18 +1038,87 @@ class InfobaseMARCProcessor:
                 )
         return updated_df, count
 
+    def _rekey_duplicate_record(self, record: Dict, original_lic: str) -> tuple:
+        """
+        Re-key a MARC record whose lookup_id_collection collided with one already
+        written in this run (duplicate xtid= in the Infobase MARC delivery).
+
+        Uses avod_title_id to construct a synthetic unique lookupID/collection key
+        so the displaced record flows through the pipeline for title-based lookup.
+
+        Returns:
+            (lookup_id, lookup_id_collection) — updated values for the record,
+            or (None, None) if no avod_title_id is available to re-key with.
+        """
+        avod_title_id = record.get('avod_title_id', '')
+        if not avod_title_id:
+            logger.error(
+                "Duplicate xtid collision for %s but no avod_title_id available "
+                "to re-key. Record '%s' will be skipped.",
+                original_lic, record.get('title', '')
+            )
+            return None, None
+
+        path_numeric = avod_title_id.split('/')[-1]
+        collection_type = record.get('collection_type', 'fod')
+        synthetic_lookup_id = f"avod={path_numeric}$"
+        new_lic = f"{synthetic_lookup_id}{collection_type}"
+
+        logger.warning(
+            "Duplicate xtid collision: %s already written this run. "
+            "Re-keying displaced record '%s' as %s for title-based lookup.",
+            original_lic,
+            record.get('title', ''),
+            new_lic
+        )
+        self.stats['xtid_collisions'] += 1
+        return synthetic_lookup_id, new_lic
+
     def _apply_marc_updates(
             self, updated_df: pd.DataFrame, new_oclc_data: dict
     ) -> Tuple[pd.DataFrame, dict]:
+        # pylint: disable=too-many-locals
         """Apply current MARC records to updated_df; return (df, counts dict)."""
         updates_applied = 0
         new_records_added = 0
         api_matches_found = 0
         today = datetime.now().strftime('%Y-%m-%d')
+
+        # Track lookupIDcollection values written during THIS run to detect
+        # intra-run collisions (two MARC records sharing the same xtid= value).
+        # This is separate from the existing-lookup-file check (mask.any() below),
+        # which handles records already in InfobaseLookup from prior runs.
+        # When a collision is detected, the displaced record is re-keyed using
+        # its avod_title_id so it gets a unique lookupIDcollection and can flow
+        # through the pipeline for title-based OCLC lookup.
+        written_this_run: set = set()
+
         for record in self.current_records:
             lookup_id = record['lookup_id']
             lookup_id_collection = record['lookup_id_collection']
+            avod_title_id = record.get('avod_title_id', '')
+
+            # Detect intra-run duplicate: same lookup_id_collection already written
+            # in this run by an earlier MARC record. This means two MARC records share
+            # the same 028$a xtid — a data error in the Infobase MARC delivery.
+            if lookup_id_collection in written_this_run:
+                lookup_id, lookup_id_collection = self._rekey_duplicate_record(
+                    record, lookup_id_collection
+                )
+                if lookup_id is None:
+                    continue
+
+            written_this_run.add(lookup_id_collection)
+
             verified_ocn, source = self._resolve_verified_ocn_and_source(record, new_oclc_data)
+
+            # Re-keyed records (avod= prefix) won't match InfobaseLookup by xtid, so
+            # they correctly fall through to NEEDS_SEARCH above. Force that here too,
+            # since _resolve_verified_ocn_and_source used the original lookup_id.
+            if lookup_id.startswith('avod='):
+                verified_ocn = 'X'
+                source = 'NEEDS_SEARCH'
+
             if source == "API_SEARCH":
                 api_matches_found += 1
                 logger.info("Using API result for %s: %s", lookup_id, verified_ocn)
@@ -963,7 +1132,7 @@ class InfobaseMARCProcessor:
                 updated_df.loc[mask, 'title'] = record['title']
                 updated_df.loc[mask, 'collection_type'] = record['collection_type']
                 updated_df.loc[mask, 'last_updated'] = today
-                updated_df.loc[mask, 'avod_title_id'] = record.get('avod_title_id', '')
+                updated_df.loc[mask, 'avod_title_id'] = avod_title_id
                 updated_df.loc[mask, 'corporate_name'] = record.get('corporate_name', '')
                 updated_df.loc[mask, 'series_name'] = record.get('series_name', '')
                 updated_df.loc[mask, 'subtitle'] = record.get('subtitle', '')
@@ -980,7 +1149,7 @@ class InfobaseMARCProcessor:
                     'title': record['title'],
                     'collection_type': record['collection_type'],
                     'last_updated': today,
-                    'avod_title_id': record.get('avod_title_id', ''),
+                    'avod_title_id': avod_title_id,
                     'corporate_name': record.get('corporate_name', ''),
                     'series_name': record.get('series_name', ''),
                     'subtitle': record.get('subtitle', ''),
@@ -1104,6 +1273,11 @@ class InfobaseMARCProcessor:
         print(f"  4. Need API search: {self.stats['needs_api_search']}")
         print("KBART changes:")
         print(f"  Records removed from collection: {self.stats['removed_records']}")
+        xtid_collisions = self.stats.get('xtid_collisions', 0)
+        if xtid_collisions:
+            print(f"DUPLICATE xtid COLLISIONS DETECTED: {xtid_collisions}")
+            print("  Displaced records re-keyed with avod= prefix for title-based lookup.")
+            print("  See WARNING lines in log above for details. Report to Infobase.")
         print("="*60)
 
         # Print rejected records summary
