@@ -113,9 +113,6 @@ class ExtendedMARCProcessor:  # pylint: disable=too-many-instance-attributes
             'api_errors': 0
         }
 
-        # Authentication token (will be set when needed)
-        self.access_token = None
-
     def load_search_terms(self) -> Dict[str, Dict]:
         """
         Load search_terms.tsv (produced by marc_processor.py, consumed by
@@ -318,23 +315,19 @@ class ExtendedMARCProcessor:  # pylint: disable=too-many-instance-attributes
 
     def get_token_cached(self) -> str:
         """
-        Get OCLC API access token with caching.
+        Get a valid OCLC API access token.
+
+        Delegates caching to the module-level OCLCAuth instance, which
+        re-checks token expiry on every call and only requests a new token
+        when the cached one is near expiration. Safe to call inside loops.
 
         Returns:
             Valid access token
         """
-        if self.access_token is None:
-            try:
-                # Create OCLCAuth class instance and get token
-                self.access_token = auth_handler.get_valid_token()
-                if not self.access_token:
-                    raise ValueError("Failed to obtain valid token")
-                logger.info("Successfully obtained OCLC API access token")
-            except Exception as e:
-                logger.error("Failed to get access token: %s", e)
-                raise
-
-        return self.access_token
+        token = auth_handler.get_valid_token()
+        if not token:
+            raise RuntimeError("Failed to retrieve a valid OCLC access token")
+        return token
 
     def _extract_numeric_id(self, lookup_id: str) -> Optional[str]:
         """
